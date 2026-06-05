@@ -353,6 +353,18 @@ bool underline_read(const Underline &disk, uint64_t sector, void *buffer) {
             asm volatile("dsb sy" ::: "memory");
             return g_status_byte[0] == 0;
         }
+        // HVF: the used ring is filled by qemu's MAIN LOOP, which only gets to run
+        // when the vCPU vm-exits occasionally. A pure busy-poll keeps the host on
+        // the vCPU and the aio completion never runs (the SMP=1 java read of
+        // sector ~62k hung at CPU 0% right here; console tracing's occasional MMIO
+        // write vm-exited and unstuck it = the Heisenbug). Re-ring the doorbell
+        // every 4096 spins -- an MMIO store vm-exits, letting qemu run its main
+        // loop to complete the request -- but only OCCASIONALLY: a per-spin
+        // doorbell thrashes the BQL and still hung. No IRQ unmask, so it's safe in
+        // syscall context (WFI/enable-IRQ crashed init via EL1-IRQ nesting).
+        if ((spin & 0xFFF) == 0xFFF) {
+            write32(disk.notify_addr, 0);
+        }
     }
     return false; // timed out
 }
@@ -396,6 +408,18 @@ bool underline_write(const Underline &disk, uint64_t sector, const void *buffer)
             g_last_used = g_used->idx;
             asm volatile("dsb sy" ::: "memory");
             return g_status_byte[0] == 0;
+        }
+        // HVF: the used ring is filled by qemu's MAIN LOOP, which only gets to run
+        // when the vCPU vm-exits occasionally. A pure busy-poll keeps the host on
+        // the vCPU and the aio completion never runs (the SMP=1 java read of
+        // sector ~62k hung at CPU 0% right here; console tracing's occasional MMIO
+        // write vm-exited and unstuck it = the Heisenbug). Re-ring the doorbell
+        // every 4096 spins -- an MMIO store vm-exits, letting qemu run its main
+        // loop to complete the request -- but only OCCASIONALLY: a per-spin
+        // doorbell thrashes the BQL and still hung. No IRQ unmask, so it's safe in
+        // syscall context (WFI/enable-IRQ crashed init via EL1-IRQ nesting).
+        if ((spin & 0xFFF) == 0xFFF) {
+            write32(disk.notify_addr, 0);
         }
     }
     return false; // timed out

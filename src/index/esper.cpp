@@ -240,9 +240,19 @@ int pick_and_claim_locked(int after) {
 // regs[0]. (This is also what makes safe a future caller that wakes
 // parents from cross-CPU contexts.)
 bool parent_is_in_wait4_locked(const Esper &p) {
+    // A parent parked in rt_sigsuspend (wait_sigsuspend) is NOT a wait4 waiter,
+    // even though sigsuspend's park leaves ipc_wait_kind==None and wake_cntpct==0
+    // (it only sets wait_sigsuspend). Without excluding it, a child's exit takes
+    // the REAP branch and overwrites the sigsuspend's regs[0]=-EINTR with the
+    // child's pid -- so sigsuspend returns a pid instead of -EINTR, the awaited
+    // SIGCHLD handler never runs, and ash's `wait` (which polls dowait(WNOHANG)
+    // then sigsuspends for SIGCHLD) loops forever without reaping. This was the
+    // real `cmd & wait` hang: not the WNOHANG path, but a sigsuspend mis-reaped
+    // as a wait4. Exclude sigsuspend so the child takes the SIGCHLD branch, which
+    // wakes the sigsuspend with -EINTR + runs the handler (correct POSIX order).
     return p.state == EsperState::waiting && p.wait_pipe_idx < 0 &&
            p.ipc_wait_kind == Esper::IpcWaitKind::None && !p.wait_futex &&
-           p.wake_cntpct == 0;
+           p.wake_cntpct == 0 && !p.wait_sigsuspend;
 }
 
 void maybe_wake_parent_locked(Esper &me) {
@@ -272,7 +282,12 @@ void maybe_wake_parent_locked(Esper &me) {
     if (chld == 0 /*SIG_DFL*/ || chld == 1 /*SIG_IGN*/) {
         return;
     }
-    if (p.state == EsperState::waiting) {
+    if (p.state == EsperState::waiting &&
+        p.ipc_wait_kind != Esper::IpcWaitKind::PtraceStop) {
+        // ptrace "Mental Out": never wake a ptrace-stopped parent here -- only the
+        // tracer's PTRACE_CONT/etc. may resume it. The SIGCHLD is still recorded
+        // by linux_deliver_signal_locked below (the Mental Out intercept turns it
+        // into a pending signal-stop the tracer collects on the next resume).
         // Interrupt the parked syscall: it returns -EINTR so the handler runs
         // (this is what makes sshd's parked ppoll wake, run its SIGCHLD reaper,
         // and tear the session down -- without it the child stays a zombie and
@@ -281,7 +296,23 @@ void maybe_wake_parent_locked(Esper &me) {
         // there as ufds=0xfffffffffffffffc; the ppoll handler guards against a
         // non-user ufds (ufds < user-ceiling) and skips the fd scan instead of
         // dereferencing it. Mirrors fortis931's prep_interrupt_wait_locked.
-        p.regs[0] = static_cast<uint64_t>(-4); // -EINTR
+        // The svc REPLAYS on resume (ipc_park did elr-=4) and re-reads regs[0] as
+        // the syscall's FIRST ARG. For read/recv-family waits (ConsoleRead,
+        // Pty*Read, *Recv, EventfdRead, InotifyRead, Epoll/Accept...) that arg is
+        // the fd/id -- clobbering it with -EINTR makes the replayed read see
+        // fd=0xfffffffffffffffc (-EBADF). An interactive shell whose prompt
+        // read() is interrupted by a *background* job's SIGCHLD then exits on the
+        // spurious read error: that is the `cmd &` / `cmd & wait` hang (sh dies,
+        // login reaps it, getty respawns -- looks like the shell "hung"). Only
+        // ppoll/pselect (PollWait) actually consumes regs[0]=-4, and it already
+        // GUARDS that value as a non-user ufds (skips the fd scan). So set the
+        // -EINTR sentinel ONLY for PollWait; every other wait keeps its real args
+        // and the signal is delivered from sig_pending on the resume drain, after
+        // which the read/recv replays cleanly (SA_RESTART-style). Mirrors Linux,
+        // where a SA_RESTART-handled signal restarts a slow read transparently.
+        if (p.ipc_wait_kind == Esper::IpcWaitKind::PollWait) {
+            p.regs[0] = static_cast<uint64_t>(-4); // -EINTR (ppoll guards ufds=-4)
+        }
         p.ipc_wait_kind = Esper::IpcWaitKind::None;
         p.ipc_wait_id = -1;
         p.wait_pipe_idx = -1;
@@ -355,6 +386,33 @@ int esper_preempt_and_pick(int cur_idx) {
     return next;
 }
 
+// ptrace "Mental Out": detach every tracee of a dying tracer (slot dead_tracer)
+// so none is left orphaned -- a tracee parked in a ptrace-stop would otherwise
+// never resume (nothing but its tracer wakes PtraceStop). Mirrors Linux's
+// exit_ptrace(): untrace each tracee and wake any that is stopped so it
+// continues running (its pending stop is simply dropped). Caller holds
+// g_esper_lock; resumed tracees are picked up by the exit path's kick / the
+// 100 Hz tick.
+void esper_detach_tracees_locked(int dead_tracer) {
+    if (dead_tracer < 0) return;
+    for (uint32_t i = 0; i < kMaxEspers; ++i) {
+        Esper &t = g_espers[i];
+        if (t.ptrace_tracer != dead_tracer) continue;
+        t.ptrace_tracer = -1;
+        t.ptrace_pending_stop = 0;
+        t.ptrace_syscall = false;
+        t.ptrace_singlestep = false;
+        if (t.state == EsperState::waiting &&
+            t.ipc_wait_kind == Esper::IpcWaitKind::PtraceStop) {
+            t.ptrace_stopped = false;
+            t.ptrace_report = false;
+            t.ipc_wait_kind = Esper::IpcWaitKind::None;
+            t.ipc_wait_id = -1;
+            t.state = EsperState::ready;
+        }
+    }
+}
+
 int esper_exit_and_pick(int me_idx, int64_t code) {
     const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
     if (me_idx >= 0 && static_cast<uint32_t>(me_idx) < kMaxEspers) {
@@ -363,10 +421,39 @@ int esper_exit_and_pick(int me_idx, int64_t code) {
         me.exit_code = code;
         clear_running_slot_locked(me_idx);
         maybe_wake_parent_locked(me);
+        esper_detach_tracees_locked(me_idx); // don't orphan a dying tracer's tracees
     }
     const int next = pick_and_claim_locked(me_idx);
     anti_skill_unlock_irqrestore(g_esper_lock, flags);
     // Parent may have become runnable (wait4 wakeup): let a secondary grab it.
+    esper_kick_secondaries();
+    return next;
+}
+
+// A thread dying by signal (SIGSEGV) takes the WHOLE thread group with it on
+// Linux. Mark every Esper sharing `mm` exited with `code` (so the scheduler
+// never resumes them -- the address space is being torn down) and wake each
+// one's wait4-blocked parent (so the shell's wait returns), then pick the next
+// ready Esper once. Used by the EL0 fault path for CLONE_VM groups: java's VM
+// thread faulting on shutdown must take down the whole JVM process, not leave
+// the main thread blocked in join or resumable into a freed mm (vma_count=0).
+int esper_group_exit_and_pick(int fault_idx, const void *mm, int64_t code) {
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    for (uint32_t i = 0; i < kMaxEspers; ++i) {
+        Esper &o = g_espers[i];
+        if (o.state == EsperState::free || o.state == EsperState::exited ||
+            o.state == EsperState::faulted) {
+            continue;
+        }
+        if (static_cast<const void *>(o.mm) != mm) continue;
+        o.state = EsperState::exited;
+        o.exit_code = code;
+        clear_running_slot_locked(static_cast<int>(i));
+        maybe_wake_parent_locked(o);
+        esper_detach_tracees_locked(static_cast<int>(i));
+    }
+    const int next = pick_and_claim_locked(fault_idx);
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
     esper_kick_secondaries();
     return next;
 }
@@ -378,9 +465,11 @@ int esper_fault_and_pick(int me_idx) {
         clear_running_slot_locked(me_idx);
         // Faulted children do not wake wait4 -- matches the legacy
         // single-core behaviour where esper_fault never touched the parent.
+        esper_detach_tracees_locked(me_idx); // a crashing tracer must not orphan its tracees
     }
     const int next = pick_and_claim_locked(me_idx);
     anti_skill_unlock_irqrestore(g_esper_lock, flags);
+    esper_kick_secondaries(); // a resumed tracee may now be runnable
     return next;
 }
 
@@ -557,8 +646,11 @@ void esper_watchdog_dump() {
         district::write(" pipe="); district::dec(static_cast<uint64_t>(static_cast<uint32_t>(e.wait_pipe_idx)));
         district::write(e.wait_pipe_is_write ? "(w)" : "(r)");
         district::write(" sys="); district::dec(static_cast<uint64_t>(e.last_syscall));
+        district::write(" futx="); district::dec(static_cast<uint64_t>(e.wait_futex ? 1 : 0));
+        district::write("@"); district::hex(e.wait_futex_phys);
+        district::write(" sigP="); district::hex(e.sig_pending);
+        district::write(" sigM="); district::hex(e.sig_mask);
         district::write(" elr="); district::hex(e.elr);
-        district::write(" ttbr0="); district::hex(e.ttbr0);
         district::write(" "); district::write(e.name);
         district::write("\n");
     }

@@ -243,6 +243,12 @@ extern "C" void kmain(uint64_t dtb_addr, uint64_t image_start, uint64_t image_en
         index::imaginary_number_district::writeln("no recognised volume");
     }
 
+    // Mount real in-memory tmpfs (Testament) over the standard volatile dirs,
+    // shadowing the baked-in ext2 placeholders -- Linux init does this via fstab.
+    // RAM-backed, so /tmp + /dev/shm are fast + truly volatile (gone on reboot).
+    index::lateran_tmpfs_mount("/tmp");
+    index::lateran_tmpfs_mount("/dev/shm");
+
     index::drivers::MisakaMail net = index::drivers::misaka_mail_probe();
     index::imaginary_number_district::write("  MisakaMail (net)   : ");
     if (net.present) {

@@ -179,10 +179,46 @@ bool ensure_user(Esper *e, uint64_t va, uint64_t len) {
     if (e == nullptr || va == 0 || len == 0) {
         return va == 0 ? false : true;
     }
-    if (e->vma_count == 0) {
-        return true; // legacy pool: already mapped
+    // Reject ranges that overflow or escape the 39-bit user VA window (mirrors
+    // Linux access_ok). Without this, pr2_prefault_range's `va + len - 1` wraps:
+    // first > last, the fault loop never runs, the range is "validated" with
+    // nothing faulted in, and the caller's kernel-side access then takes an
+    // unhandled EL1 abort. va<ceiling && len<=ceiling => va+len can't wrap u64.
+    constexpr uint64_t kUserCeiling = 0x8000000000ULL; // 1<<39
+    if (va >= kUserCeiling || len > kUserCeiling || va + len > kUserCeiling) {
+        return false;
+    }
+    if (e->mm == nullptr) {
+        return true; // Index legacy pool: no VMA list, already fully mapped
     }
     return pr2_prefault_range(e, va, len);
+}
+
+// Copy a user C-string into a kernel buffer, prefaulting one page at a time so
+// the caller never dereferences an unmapped user page at EL1 (an unhandled data
+// abort -> kernel crash). Stops at NUL or cap-1; returns false on a fault before
+// NUL (a page the string runs into has no VMA). Mirrors Linux strncpy_from_user.
+// dst is always NUL-terminated on a true return.
+bool copy_user_cstr(Esper *e, uint64_t va, char *dst, uint32_t cap) {
+    if (e == nullptr || va == 0 || dst == nullptr || cap == 0) {
+        return false;
+    }
+    constexpr uint64_t kUserCeiling = 0x8000000000ULL;
+    uint64_t mapped_page = ~0ULL;
+    for (uint32_t i = 0; i + 1 < cap; ++i) {
+        const uint64_t a = va + i;
+        if (a >= kUserCeiling) return false;
+        const uint64_t pg = a & ~uint64_t(0xFFF);
+        if (pg != mapped_page) {
+            if (!ensure_user(e, pg, 1)) return false; // prefault this page or fail
+            mapped_page = pg;
+        }
+        const char c = *reinterpret_cast<const char *>(a);
+        dst[i] = c;
+        if (c == 0) return true;
+    }
+    dst[cap - 1] = 0; // path longer than cap -> truncate
+    return true;
 }
 
 // --- TTY / termios (the console line discipline) ---------------------------
@@ -200,9 +236,15 @@ bool g_termios_init = false;
 
 // Scratch buffer for getdents64 (file scope to avoid a function-local static).
 // /bin alone already has ~95 entries (busybox applet symlinks); bumped from 64
-// after `ls /bin | wc -l` truncated. Each entry is ~104 bytes so 256 ~= 26 KiB
-// in bss, which the kernel can easily afford.
-LateranEntry g_dirents[256];
+// after `ls /bin | wc -l` truncated. Each entry is ~104 bytes so 256 ~= 26 KiB.
+// PER-CPU: getdents64 fills this then packs it into the user buffer within one
+// syscall. EL1 syscalls are never preempted/migrated (esper_preempt bails when
+// it interrupts EL1), so this_cpu_id() is stable across fill+pack -- but two
+// CPUs running getdents64 concurrently would otherwise clobber a single shared
+// buffer (concurrent `ls` in two SSH sessions => corrupted listings). One row
+// per CPU makes it race-free with no lock. ~26 KiB * 8 = ~208 KiB bss.
+constexpr uint32_t kGetdentsScratchCpus = 8; // >= kMaxCpus (artificial_heaven.hpp)
+LateranEntry g_dirents[kGetdentsScratchCpus][256];
 
 // AT_FDCWD: openat/unlinkat/etc. dirfd value that means "resolve relative
 // paths against the caller's cwd". Linux defines it as -100.
@@ -300,7 +342,15 @@ bool resolve_path(Esper *e, const char *dirfd_path, const char *path,
 // openat-style: pick the right base path for a dirfd. AT_FDCWD or any dirfd
 // that isn't a real open dir → use cwd via resolve_path(e, nullptr, ...).
 bool resolve_at(Esper *e, int32_t dirfd, const char *path, char *out, uint32_t cap) {
-    if (path != nullptr && path[0] == '/') {
+    // Copy the user path into a kernel buffer up front (prefaulting page by page)
+    // so resolve_path never dereferences an unmapped user page at EL1. Every
+    // caller passes a user pointer (a syscall's path_va).
+    char kpath[kCwdCap];
+    if (!copy_user_cstr(e, reinterpret_cast<uint64_t>(path), kpath, sizeof(kpath))) {
+        return false;
+    }
+    path = kpath;
+    if (path[0] == '/') {
         return resolve_path(e, nullptr, path, out, cap);
     }
     if (dirfd == kAtFdCwd) {
@@ -506,6 +556,57 @@ bool str_prefix(const char *s, const char *pfx) {
     while (*pfx) { if (*s != *pfx) return false; ++s; ++pfx; }
     return true;
 }
+
+// inotify IN_* event bits (Linux uapi/inotify.h).
+constexpr uint32_t IN_MODIFY      = 0x00000002;
+constexpr uint32_t IN_MOVED_FROM  = 0x00000040;
+constexpr uint32_t IN_MOVED_TO    = 0x00000080;
+constexpr uint32_t IN_CREATE      = 0x00000100;
+constexpr uint32_t IN_DELETE      = 0x00000200;
+constexpr uint32_t IN_ISDIR       = 0x40000000;
+
+// Kazakiri: the inotify producer. Called from the VFS mutation syscalls after a
+// successful change to `abs`. Scans every inotify instance's watches: a watch on
+// the parent directory of `abs` gets a child event carrying the basename; a watch
+// on `abs` itself gets a name-less self event. Cheap when no watches exist (the
+// common case) -- it only enqueues + wakes when an interested watch is present.
+static void kazakiri_notify(const char *abs, uint32_t mask, uint32_t cookie = 0) {
+    if (abs == nullptr || abs[0] == 0) return;
+    if (!inotify_any_watches()) return; // fast path: nobody is watching
+    uint32_t len = 0; while (abs[len] != 0) ++len;
+    int slash = -1;
+    for (int i = static_cast<int>(len) - 1; i >= 0; --i)
+        if (abs[i] == '/') { slash = i; break; }
+    char dir[kInotifyPathCap];
+    char base[kInotifyNameCap];
+    if (slash < 0) {
+        dir[0] = 0; // relative path -> no parent to match (absolute watches won't hit)
+        uint32_t j = 0; for (; j + 1 < kInotifyNameCap && abs[j]; ++j) base[j] = abs[j]; base[j] = 0;
+    } else {
+        const uint32_t dl = static_cast<uint32_t>(slash);
+        if (dl == 0) { dir[0] = '/'; dir[1] = 0; }          // parent is root
+        else { uint32_t j = 0; for (; j + 1 < kInotifyPathCap && j < dl; ++j) dir[j] = abs[j]; dir[j] = 0; }
+        const char *b = abs + slash + 1;
+        uint32_t j = 0; for (; j + 1 < kInotifyNameCap && b[j]; ++j) base[j] = b[j]; base[j] = 0;
+    }
+    const uint32_t core = mask & 0xfffu; // selector bits (exclude IN_ISDIR etc.)
+    bool any = false;
+    for (uint32_t i = 0; i < kMaxInotify; ++i) {
+        Inotify *in = inotify_at(static_cast<int>(i));
+        if (in == nullptr) continue;
+        for (uint32_t w = 0; w < kInotifyWatches; ++w) {
+            InotifyWatch &wt = in->watches[w];
+            if (!wt.in_use || (wt.mask & core) == 0) continue;
+            if (str_eq(wt.path, dir)) { inotify_enqueue(in, wt.wd, mask, cookie, base); any = true; }
+            else if (str_eq(wt.path, abs)) { inotify_enqueue(in, wt.wd, mask, cookie, ""); any = true; }
+        }
+    }
+    if (any) {
+        linux_ipc_wake(Esper::IpcWaitKind::InotifyRead, -1);
+        linux_ipc_wake(Esper::IpcWaitKind::PollWait, -1);
+        linux_ipc_wake(Esper::IpcWaitKind::EpollWait, -1);
+    }
+}
 // Resolve fd -> the pathname /proc/<pid>/fd/<n> symlinks to. This is the Linux
 // mechanism musl/glibc ttyname() relies on: a pty slave fd resolves to the
 // "/dev/pts/N" string it then stats. Returns false for fds with no stable path
@@ -559,7 +660,9 @@ int64_t fd_write_dispatch(Esper *me, int idx, uint32_t fd, const char *buf,
     const FdKind kind = me->fds[fd].kind;
     if (kind == FdKind::file) {
         if (!me->fds[fd].writable) return -9; // -EBADF: opened read-only
-        return linux_file_write(me, fd, buf, len);
+        const int64_t w = linux_file_write(me, fd, buf, len);
+        if (w > 0 && me->fds[fd].path[0] != 0) kazakiri_notify(me->fds[fd].path, IN_MODIFY);
+        return w;
     }
     if (kind == FdKind::pipe_write) {
         return linux_pipe_write(idx, fd, buf, len, frame);
@@ -683,6 +786,50 @@ int64_t fd_read_dispatch(Esper *me, int idx, uint32_t fd, char *buf,
             }
         }
     }
+    if (kind == FdKind::timerfd) {
+        if (len < 8) return -22;
+        TimerFd *t = timerfd_at(me->fds[fd].sock_idx);
+        if (t == nullptr) return -9;
+        uint64_t exp = 0;
+        const uint64_t now = read_cntpct();
+        if (t->expire_cnt != 0 && now >= t->expire_cnt) {
+            exp = 1;
+            if (t->interval_cnt != 0) {
+                exp += (now - t->expire_cnt) / t->interval_cnt;
+                t->expire_cnt += exp * t->interval_cnt; // advance past all missed periods
+            } else {
+                t->expire_cnt = 0; // one-shot: disarm
+            }
+        }
+        if (exp == 0) return -11; // -EAGAIN: not expired (wait via poll/epoll)
+        *reinterpret_cast<uint64_t *>(buf) = exp;
+        return 8;
+    }
+    if (kind == FdKind::signalfd) {
+        SignalFd *s = signalfd_at(me->fds[fd].sock_idx);
+        if (s == nullptr) return -9;
+        const uint64_t deliverable = me->sig_pending & s->mask;
+        if (deliverable == 0) return -11; // -EAGAIN: nothing pending in the mask
+        if (len < 128) return -22;        // struct signalfd_siginfo is 128 bytes
+        const int sig = __builtin_ctzll(deliverable) + 1;
+        me->sig_pending &= ~(1ULL << (sig - 1)); // consume: delivered via the fd
+        for (uint32_t i = 0; i < 128; ++i) buf[i] = 0;
+        *reinterpret_cast<uint32_t *>(buf) = static_cast<uint32_t>(sig); // ssi_signo
+        return 128;
+    }
+    if (kind == FdKind::inotify) {
+        Inotify *in = inotify_at(me->fds[fd].sock_idx);
+        if (in == nullptr) return -9;
+        const int64_t r = inotify_read_one(in, reinterpret_cast<uint8_t *>(buf), len);
+        if (r != -11) return r; // an event (>0) or -EINVAL (buffer too small)
+        if (in->nonblock) return -11; // -EAGAIN: ring empty, non-blocking
+        // Block until a mutation queues an event (kazakiri_notify wakes us).
+        if (linux_ipc_park(idx, Esper::IpcWaitKind::InotifyRead,
+                           me->fds[fd].sock_idx, frame) >= 0) {
+            return kFdParked;
+        }
+        return -11;
+    }
     if (kind == FdKind::eventfd) {
         if (len < 8) return -22;
         const int s = me->fds[fd].sock_idx;
@@ -781,6 +928,23 @@ bool linux_deliver_signal_locked(Esper *e, int sig, uint64_t *frame) {
         return false;
     }
     const uint64_t bit = 1ULL << (sig - 1);
+
+    // ptrace "Mental Out" intercept: a traced tracee turns most signals into a
+    // pending ptrace signal-stop (the syscall-return drain parks it + reports to
+    // the tracer's wait4) instead of delivering them. SIGKILL is never trapped.
+    // A signal injected by the tracer (CONT/SYSCALL data arg) passes through once
+    // via ptrace_inject_sig so the tracer can actually deliver a signal. Setting
+    // the sig_pending bit makes an interruptible blocking syscall (ppoll/read)
+    // wake so the tracee reaches the drain and stops.
+    if (e->ptrace_tracer >= 0 && sig != 9 /*SIGKILL*/) {
+        if (e->ptrace_inject_sig == sig) {
+            e->ptrace_inject_sig = 0; // one-shot pass-through -> deliver normally
+        } else {
+            if (e->ptrace_pending_stop == 0) e->ptrace_pending_stop = sig;
+            e->sig_pending |= bit;
+            return true; // consumed: turned into a pending ptrace-stop
+        }
+    }
 
     // rt_sigsuspend wake: a signal arriving at a sigsuspend-parked Esper
     // restores its pre-sigsuspend mask and flips it back to ready. The
@@ -935,6 +1099,18 @@ static uint32_t linux_fd_revents(Esper *me, int fd) {
         EventFd *e = eventfd_at(me->fds[fd].sock_idx);
         uint32_t re = 0x4; if (e != nullptr && e->counter > 0) re |= 0x1; return re;
     }
+    case FdKind::timerfd: {
+        TimerFd *t = timerfd_at(me->fds[fd].sock_idx);
+        return (t != nullptr && t->expire_cnt != 0 && read_cntpct() >= t->expire_cnt) ? 0x1u : 0u;
+    }
+    case FdKind::signalfd: {
+        SignalFd *s = signalfd_at(me->fds[fd].sock_idx);
+        return (s != nullptr && (me->sig_pending & s->mask) != 0) ? 0x1u : 0u;
+    }
+    case FdKind::inotify: {
+        Inotify *in = inotify_at(me->fds[fd].sock_idx);
+        return inotify_has_events(in) ? 0x1u : 0u;
+    }
     case FdKind::pipe_read:  return aiwass_readable(me->fds[fd].pipe_idx) ? 0x1u : 0u;
     case FdKind::pipe_write: return aiwass_writable(me->fds[fd].pipe_idx) ? 0x4u : 0u;
     case FdKind::console:
@@ -974,6 +1150,7 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint32_t fd = static_cast<uint32_t>(frame[0]);
         const uint64_t iov_va = frame[1];
         const uint64_t cnt = frame[2];
+        if (cnt > 1024) { frame[0] = static_cast<uint64_t>(-22); return; } // UIO_MAXIOV: bound before cnt*16 can overflow
         if (!ensure_user(me, iov_va, cnt * sizeof(IoVec))) {
             frame[0] = static_cast<uint64_t>(-14); return;
         }
@@ -1016,6 +1193,7 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint32_t fd = static_cast<uint32_t>(frame[0]);
         const uint64_t iov_va = frame[1];
         const uint64_t cnt = frame[2];
+        if (cnt > 1024) { frame[0] = static_cast<uint64_t>(-22); return; } // UIO_MAXIOV: bound before cnt*16 can overflow
         if (!ensure_user(me, iov_va, cnt * sizeof(IoVec))) {
             frame[0] = static_cast<uint64_t>(-14); return;
         }
@@ -1286,6 +1464,12 @@ void linux_syscall_dispatch(uint64_t *frame) {
             return;
         }
 
+        // inotify IN_CREATE fires only when O_CREAT actually makes a new file, so
+        // record prior existence -- but only for O_CREAT opens, so the common
+        // non-creating open pays nothing.
+        bool pre_exists = true;
+        if (create) { LateranEntry cst; pre_exists = lateran_is_dir(abs) || lateran_stat(abs, &cst); }
+
         int fd = (writable || create)
                      ? linux_file_open_ex(me, abs, create, trunc, writable)
                      : linux_file_open(me, abs);
@@ -1298,6 +1482,7 @@ void linux_syscall_dispatch(uint64_t *frame) {
             const int64_t sz = linux_fd_size(me, static_cast<uint32_t>(fd));
             if (sz > 0) linux_fd_seek(me, static_cast<uint32_t>(fd), static_cast<uint64_t>(sz));
         }
+        if (fd >= 0 && create && !pre_exists) kazakiri_notify(abs, IN_CREATE);
         frame[0] = (fd >= 0) ? static_cast<uint64_t>(fd) : static_cast<uint64_t>(-2); // -ENOENT
         return;
     }
@@ -1312,7 +1497,10 @@ void linux_syscall_dispatch(uint64_t *frame) {
         if (!resolve_at(me, dirfd, reinterpret_cast<const char *>(path_va), abs, kCwdCap)) {
             frame[0] = static_cast<uint64_t>(-2); return;
         }
-        frame[0] = lateran_unlink(abs) ? 0 : static_cast<uint64_t>(-2); // -ENOENT
+        const bool was_dir = lateran_is_dir(abs); // capture before removal (IN_ISDIR)
+        const bool ok = lateran_unlink(abs);
+        if (ok) kazakiri_notify(abs, IN_DELETE | (was_dir ? IN_ISDIR : 0u));
+        frame[0] = ok ? 0 : static_cast<uint64_t>(-2); // -ENOENT
         return;
     }
     case 34 /*mkdirat*/: {
@@ -1325,7 +1513,9 @@ void linux_syscall_dispatch(uint64_t *frame) {
         if (!resolve_at(me, dirfd, reinterpret_cast<const char *>(path_va), abs, kCwdCap)) {
             frame[0] = static_cast<uint64_t>(-2); return;
         }
-        frame[0] = lateran_mkdir(abs) ? 0 : static_cast<uint64_t>(-17); // -EEXIST / failure
+        const bool mok = lateran_mkdir(abs);
+        if (mok) kazakiri_notify(abs, IN_CREATE | IN_ISDIR);
+        frame[0] = mok ? 0 : static_cast<uint64_t>(-17); // -EEXIST / failure
         return;
     }
     case 78 /*readlinkat*/: {
@@ -1343,6 +1533,28 @@ void linux_syscall_dispatch(uint64_t *frame) {
         char abs[kCwdCap];
         if (!resolve_at(me, dirfd, reinterpret_cast<const char *>(path_va), abs, kCwdCap)) {
             frame[0] = static_cast<uint64_t>(-2); return;
+        }
+        // /proc/self/exe (and /proc/<pid>/exe for self) -> the running image's
+        // absolute path. The musl dynamic loader readlink()s this to resolve
+        // $ORIGIN in a binary's RUNPATH -- without it the OpenJDK launcher can't
+        // locate libjli.so ($ORIGIN/../lib/aarch64/jli) and dies at startup.
+        if (me != nullptr && me->exe_path[0] != 0) {
+            bool is_exe = str_eq(abs, "/proc/self/exe");
+            if (!is_exe && str_prefix(abs, "/proc/")) {
+                const char *q = abs + 6;
+                uint32_t pid = 0;
+                while (*q >= '0' && *q <= '9') { pid = pid * 10 + (*q - '0'); ++q; }
+                is_exe = (q != abs + 6 && pid == me->pid &&
+                          q[0] == '/' && q[1] == 'e' && q[2] == 'x' && q[3] == 'e' && q[4] == 0);
+            }
+            if (is_exe) {
+                uint32_t ln = 0; while (me->exe_path[ln] != 0) ++ln;
+                const uint32_t w = (ln < cap) ? ln : static_cast<uint32_t>(cap);
+                uint8_t *out = reinterpret_cast<uint8_t *>(buf_va);
+                for (uint32_t i = 0; i < w; ++i) out[i] = static_cast<uint8_t>(me->exe_path[i]);
+                frame[0] = w;
+                return;
+            }
         }
         // /proc/self/fd/<N> and /proc/<pid>/fd/<N> are symlinks to the open
         // file's path -- the Linux mechanism musl/glibc ttyname() uses to turn
@@ -1419,7 +1631,19 @@ void linux_syscall_dispatch(uint64_t *frame) {
             !resolve_at(me, new_dirfd, reinterpret_cast<const char *>(new_va), new_abs, kCwdCap)) {
             frame[0] = static_cast<uint64_t>(-2); return;
         }
-        frame[0] = lateran_rename(old_abs, new_abs) ? 0 : static_cast<uint64_t>(-2);
+        const bool rdir = lateran_is_dir(old_abs); // capture before the move (IN_ISDIR)
+        const bool rok = lateran_rename(old_abs, new_abs);
+        if (rok) {
+            // MOVED_FROM + MOVED_TO carry a shared nonzero cookie so a watcher can
+            // pair the two halves of a rename (Linux semantics).
+            static uint32_t g_mv_cookie = 0;
+            uint32_t cookie = __atomic_add_fetch(&g_mv_cookie, 1, __ATOMIC_RELAXED);
+            if (cookie == 0) cookie = 1;
+            const uint32_t dirbit = rdir ? IN_ISDIR : 0u;
+            kazakiri_notify(old_abs, IN_MOVED_FROM | dirbit, cookie);
+            kazakiri_notify(new_abs, IN_MOVED_TO | dirbit, cookie);
+        }
+        frame[0] = rok ? 0 : static_cast<uint64_t>(-2);
         return;
     }
     case 45 /*truncate*/: {
@@ -1593,25 +1817,28 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint64_t cap = frame[2];
         if (!linux_fd_is_file(me, fd)) { frame[0] = static_cast<uint64_t>(-20); return; } // -ENOTDIR
         if (!ensure_user(me, dirp, cap)) { frame[0] = static_cast<uint64_t>(-14); return; }
-        // Gather the directory's entries (small dirs). g_dirents is a file-scope
-        // scratch buffer (a function-local static would need a C++ init guard).
-        const uint32_t total = lateran_list_dir(linux_fd_path(me, fd), g_dirents, 256);
+        // Per-CPU scratch row (race-free vs a concurrent getdents64 on another
+        // CPU; EL1 syscalls don't migrate, so this_cpu_id() is stable here).
+        const uint32_t cpu = (arch::this_cpu_id() < kGetdentsScratchCpus)
+                                 ? arch::this_cpu_id() : 0;
+        LateranEntry *dents = g_dirents[cpu];
+        const uint32_t total = lateran_list_dir(linux_fd_path(me, fd), dents, 256);
         const uint64_t start = linux_fd_tell(me, fd); // resume cursor
         uint8_t *out = reinterpret_cast<uint8_t *>(dirp);
         uint64_t used = 0;
         uint32_t i = static_cast<uint32_t>(start);
         for (; i < total; ++i) {
             uint32_t nlen = 0;
-            while (g_dirents[i].name[nlen]) ++nlen;
+            while (dents[i].name[nlen]) ++nlen;
             const uint64_t reclen = (19 + nlen + 1 + 7) & ~uint64_t(7); // align 8
             if (used + reclen > cap) break;
             uint8_t *d = out + used;
             for (uint32_t b = 0; b < reclen; ++b) d[b] = 0;
-            *reinterpret_cast<uint64_t *>(d + 0) = g_dirents[i].first_cluster + 2; // d_ino
+            *reinterpret_cast<uint64_t *>(d + 0) = dents[i].first_cluster + 2; // d_ino
             *reinterpret_cast<int64_t *>(d + 8) = static_cast<int64_t>(i + 1); // d_off
             *reinterpret_cast<uint16_t *>(d + 16) = static_cast<uint16_t>(reclen);
-            d[18] = g_dirents[i].is_dir ? 4 /*DT_DIR*/ : 8 /*DT_REG*/;
-            for (uint32_t b = 0; b < nlen; ++b) d[19 + b] = static_cast<uint8_t>(g_dirents[i].name[b]);
+            d[18] = dents[i].is_dir ? 4 /*DT_DIR*/ : 8 /*DT_REG*/;
+            for (uint32_t b = 0; b < nlen; ++b) d[19 + b] = static_cast<uint8_t>(dents[i].name[b]);
             used += reclen;
         }
         linux_fd_seek(me, fd, i); // advance cursor past what we returned
@@ -1628,16 +1855,17 @@ void linux_syscall_dispatch(uint64_t *frame) {
     // ---- memory -------------------------------------------------------
     case 214 /*brk*/: {
         const uint64_t req = frame[0];
-        if (me == nullptr) { frame[0] = 0; return; }
+        if (me == nullptr || me->mm == nullptr) { frame[0] = 0; return; }
+        PersonalReality *mm = me->mm; // brk lives in the shared address space
         if (req == 0) {
-            frame[0] = me->brk_cur; // query
+            frame[0] = mm->brk_cur; // query
             return;
         }
-        if (req >= me->brk_start && req <= me->brk_start + 0x4000000ULL) {
-            me->brk_cur = req; // pages fault in (zero) on demand
-            frame[0] = me->brk_cur;
+        if (req >= mm->brk_start && req <= mm->brk_start + 0x4000000ULL) {
+            mm->brk_cur = req; // pages fault in (zero) on demand
+            frame[0] = mm->brk_cur;
         } else {
-            frame[0] = me->brk_cur; // refuse out-of-range; return unchanged break
+            frame[0] = mm->brk_cur; // refuse out-of-range; return unchanged break
         }
         return;
     }
@@ -1655,16 +1883,44 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint64_t flags = frame[3];
         const uint64_t fd = frame[4];
         const uint64_t offset = frame[5];
-        if (me == nullptr || len == 0) { frame[0] = static_cast<uint64_t>(-12); return; }
+        if (me == nullptr || me->mm == nullptr || len == 0) { frame[0] = static_cast<uint64_t>(-12); return; }
         const uint64_t alen = (len + 0xFFF) & ~uint64_t(0xFFF);
+        // Bound the length: the page-round must not wrap (alen < len), and the
+        // mapping must fit under the 39-bit EL0 ceiling. Mainstream mmap caps
+        // length to TASK_SIZE; without this a len near 2^64 wraps alen to 0 /
+        // garbage and pr2_add_vma's own (end+mask) round then stores a bogus or
+        // inverted VMA. (#3-class integer overflow on a user-controlled length.)
+        constexpr uint64_t kUserCeiling = 0x8000000000ULL;
+        if (alen == 0 || alen < len || alen > kUserCeiling) {
+            frame[0] = static_cast<uint64_t>(-12); return; // -ENOMEM
+        }
         const bool fixed = (flags & 0x10) != 0;
         uint64_t at;
         if (fixed) {
             if (addr == 0) { frame[0] = static_cast<uint64_t>(-22); return; } // -EINVAL
             at = addr & ~uint64_t(0xFFF);
-            pr2_remove_vma_range(me, at, at + alen);
+        } else if (addr != 0) {
+            // Honor a non-NULL hint when that range is free (Linux mmap places a
+            // mapping at the hint if possible). HotSpot reserves its heap at a
+            // computed narrow-oop base via a hint; a bump-only allocator that
+            // ignores it makes HotSpot retry across the whole address space and
+            // eventually MAP_FIXED over the dynamic linker (gap 10). Fall back to
+            // the bump pointer if the hint range is already taken.
+            const uint64_t h = addr & ~uint64_t(0xFFF);
+            // Don't honor a low hint (Linux mmap_min_addr): placing a mapping
+            // at/near 0 would defeat NULL-deref protection. Fall back to the
+            // bump pointer for low or already-taken hints.
+            constexpr uint64_t kMmapMinAddr = 0x10000; // 64 KiB
+            at = (h >= kMmapMinAddr && h <= kUserCeiling - alen && pr2_range_free(me, h, h + alen))
+                     ? h : me->mm->mmap_next;
         } else {
-            at = me->mmap_next;
+            at = me->mm->mmap_next;
+        }
+        if (at > kUserCeiling - alen) { // at + alen would overflow / exceed the ceiling
+            frame[0] = static_cast<uint64_t>(-12); return; // -ENOMEM
+        }
+        if (fixed) {
+            pr2_remove_vma_range(me, at, at + alen);
         }
         uint8_t vprot = kVmaProtR;
         if (prot & 0x2) vprot |= kVmaProtW; // PROT_WRITE
@@ -1674,12 +1930,18 @@ void linux_syscall_dispatch(uint64_t *frame) {
             ok = pr2_add_vma(me, at, at + alen, vprot,
                              static_cast<uint8_t>(VmaKind::Anon), nullptr, 0, 0, 0);
         } else if (linux_fd_is_file(me, static_cast<uint32_t>(fd))) {
-            uint64_t fsz = 0;
-            uint8_t *buf = linux_file_mmap_buf(me, static_cast<uint32_t>(fd), &fsz);
-            if (buf == nullptr) { frame[0] = static_cast<uint64_t>(-12); return; }
-            const uint64_t avail = (offset < fsz) ? (fsz - offset) : 0;
+            // Demand-paged file mmap: record path + offset and fault pages in from
+            // the filesystem on first touch, instead of slurping the whole file
+            // into the kernel heap (rt.jar is 33 MB; the old whole-file buffer
+            // OOM'd the 64 MB heap and was capped at 8 buffers). file_src=nullptr
+            // + file_path marks the VMA demand-paged (see pr2_handle_fault).
+            const char *fpath = me->fds[static_cast<uint32_t>(fd)].path;
+            const int64_t fsz = linux_file_size(fpath);
+            if (fsz < 0) { frame[0] = static_cast<uint64_t>(-12); return; }
+            const uint64_t avail = (offset < static_cast<uint64_t>(fsz))
+                                       ? (static_cast<uint64_t>(fsz) - offset) : 0;
             ok = pr2_add_vma(me, at, at + alen, vprot,
-                             static_cast<uint8_t>(VmaKind::File), buf, offset, avail, at);
+                             static_cast<uint8_t>(VmaKind::File), nullptr, offset, avail, at, fpath);
         } else {
             frame[0] = static_cast<uint64_t>(-9); // -EBADF
             return;
@@ -1688,8 +1950,11 @@ void linux_syscall_dispatch(uint64_t *frame) {
             frame[0] = static_cast<uint64_t>(-12); // -ENOMEM (VMA table full)
             return;
         }
-        if (!fixed) {
-            me->mmap_next += alen;
+        // Bump the pointer past this mapping. With a honored hint `at` may be
+        // above the old mmap_next, so advance to at+alen (not just +=alen) to
+        // keep later anonymous mmaps from colliding with the hinted placement.
+        if (!fixed && at + alen > me->mm->mmap_next) {
+            me->mm->mmap_next = at + alen;
         }
         frame[0] = at;
         return;
@@ -2011,9 +2276,22 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint64_t user_sp = m[32];
         const uint64_t user_pc = m[33];
         const uint64_t user_pstate = m[34];
+        // SECURITY: the rt_sigframe lives on the user stack and is fully
+        // attacker-controllable. Restoring spsr_el1 verbatim would let EL0 set the
+        // PSTATE mode bits to EL1 -- on the eret out of this syscall the CPU would
+        // then run the (also attacker-chosen) PC at EL1 = full EL0->EL1 privilege
+        // escalation (classic sigreturn / SROP). It would also let EL0 set DAIF to
+        // mask IRQs and run un-preemptibly (scheduler-starving DoS). Sanitize like
+        // Linux valid_user_regs(): keep only the user-owned condition flags (NZCV)
+        // and force every other bit to the canonical EL0 PSTATE (kSpsrEl0 = EL0t,
+        // IRQ-enabled/preemptible, AArch64). NZCV must survive so the interrupted
+        // code resumes with its arithmetic flags (POSIX).
+        constexpr uint64_t kNzcvMask = 0xF0000000ULL; // N,Z,C,V (bits 31..28)
+        const uint64_t safe_pstate = (user_pstate & kNzcvMask) |
+                                     (kSpsrEl0Handler & ~kNzcvMask); // 0x340 = EL0t, preemptible
         asm volatile("msr sp_el0, %0" ::"r"(user_sp));
         asm volatile("msr elr_el1, %0" ::"r"(user_pc));
-        asm volatile("msr spsr_el1, %0" ::"r"(user_pstate));
+        asm volatile("msr spsr_el1, %0" ::"r"(safe_pstate));
         // If the mask dropped enough that a pending signal is now deliverable,
         // chain-deliver one -- otherwise the handler we just returned from
         // could leave queued signals stranded forever.
@@ -2264,17 +2542,40 @@ void linux_syscall_dispatch(uint64_t *frame) {
         frame[0] = old;
         return;
     }
-    case 40 /*mount*/:
-    case 39 /*umount2*/:
-        // Accept silently. Index has a single filesystem (Lateran/ext2) plus
-        // procfs and the /host 9p prefix routed through Lateran, all of them
-        // visible without an explicit mount. Returning 0 keeps shell scripts
-        // and init programs (busybox `mount -a`, alpine-style init) happy --
-        // they call mount(2) for /proc, /sys, tmpfs, etc. and would otherwise
-        // bail on ENOSYS. Any /proc/mounts the user reads is synthesised by
-        // procfs from the actual baked-in layout.
+    case 40 /*mount*/: {
+        // mount(source, target, fstype, flags, data). "tmpfs" creates a real
+        // in-memory (Testament) mount at the resolved target. Other fstypes
+        // (proc/sysfs/9p) are already visible via Lateran, so accept silently
+        // (busybox `mount -a` / alpine init expect 0, not ENOSYS).
+        if (me != nullptr) {
+            char fstype[16] = {};
+            copy_user_cstr(me, frame[2], fstype, sizeof(fstype));
+            const bool is_tmpfs = fstype[0] == 't' && fstype[1] == 'm' &&
+                                  fstype[2] == 'p' && fstype[3] == 'f' &&
+                                  fstype[4] == 's' && fstype[5] == 0;
+            char abs[kCwdCap];
+            if (is_tmpfs && frame[1] != 0 &&
+                resolve_at(me, -100 /*AT_FDCWD*/,
+                           reinterpret_cast<const char *>(frame[1]), abs, kCwdCap)) {
+                lateran_tmpfs_mount(abs);
+            }
+        }
         frame[0] = 0;
         return;
+    }
+    case 39 /*umount2*/: {
+        // umount2(target, flags). If `target` is a tmpfs mount, tear it down;
+        // otherwise accept silently (nothing to unmount for the baked layout).
+        if (me != nullptr && frame[0] != 0) {
+            char abs[kCwdCap];
+            if (resolve_at(me, -100 /*AT_FDCWD*/,
+                           reinterpret_cast<const char *>(frame[0]), abs, kCwdCap)) {
+                lateran_tmpfs_umount(abs);
+            }
+        }
+        frame[0] = 0;
+        return;
+    }
     case 154 /*setpgid*/: {
         // setpgid(pid, pgid). pid=0 means self; pgid=0 means "make pgid==pid"
         // (start a new group led by self). Real POSIX requires same session,
@@ -2418,6 +2719,30 @@ void linux_syscall_dispatch(uint64_t *frame) {
         frame[0] = 0;
         return;
     }
+    case 114 /*clock_getres*/: {
+        // Resolution probe. HotSpot's os::Linux::clock_init() calls this for
+        // CLOCK_MONOTONIC; an ENOSYS made it warn "No monotonic clock available"
+        // and fall back to gettimeofday. Report the real granularity: ~1 ns for
+        // the RTC-derived realtime clock, the CNTPCT period (~16 ns @ 62.5 MHz)
+        // for the monotonic clock.
+        const uint64_t clk_id = frame[0];
+        const uint64_t ts_va = frame[1];
+        if (ts_va != 0) {
+            if (!ensure_user(me, ts_va, 16)) { frame[0] = static_cast<uint64_t>(-14); return; }
+            int64_t *ts = reinterpret_cast<int64_t *>(ts_va);
+            ts[0] = 0;
+            if (clk_id == 0 /*REALTIME*/ || clk_id == 5 /*REALTIME_COARSE*/) {
+                ts[1] = 1; // 1 ns
+            } else {
+                uint64_t freq = 0; asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+                if (freq == 0) freq = 62500000;
+                const int64_t r = static_cast<int64_t>(1000000000ULL / freq);
+                ts[1] = (r > 0) ? r : 1;
+            }
+        }
+        frame[0] = 0;
+        return;
+    }
     case 169 /*gettimeofday*/: {
         const uint64_t tv_va = frame[0];
         if (tv_va != 0 && ensure_user(me, tv_va, 16)) {
@@ -2437,7 +2762,12 @@ void linux_syscall_dispatch(uint64_t *frame) {
         if (!ensure_user(me, va, 6 * 65)) { frame[0] = static_cast<uint64_t>(-14); return; }
         char *u = reinterpret_cast<char *>(va);
         for (uint32_t i = 0; i < 6 * 65; ++i) u[i] = 0;
-        const char *fields[6] = {"Index", "index", "5.0.0-Index", "#1", "aarch64", "(none)"};
+        // sysname MUST be "Linux" for Linux-ABI binaries: the JDK's
+        // sun.nio.fs.DefaultFileSystemProvider (and many glibc/musl platform
+        // checks) switch on os.name (== uname.sysname) and throw "Platform not
+        // recognized" for anything else -- "Index" broke java's nio init. Index
+        // identity is kept in nodename ("index") and release ("5.0.0-Index").
+        const char *fields[6] = {"Linux", "index", "5.0.0-Index", "#1", "aarch64", "(none)"};
         for (uint32_t f = 0; f < 6; ++f) {
             const char *s = fields[f];
             char *d = u + f * 65;
@@ -2628,8 +2958,8 @@ void linux_syscall_dispatch(uint64_t *frame) {
             // 39-bit user ceiling) so a corrupt arg skips the scan -- and the
             // signal check above still runs -- instead of dereferencing it (the
             // ufds=0xfffffffffffffffc EL1 data abort seen at logout).
-            if (ufds != 0 && nfds > 0 && ufds < 0x8000000000ULL &&
-                ensure_user(me, ufds, nfds * 8)) {
+            if (ufds != 0 && nfds > 0 && nfds <= 4096 && ufds < 0x8000000000ULL &&
+                ensure_user(me, ufds, nfds * 8)) { // nfds bound: keep nfds*8 from overflowing
                 for (uint64_t i = 0; i < nfds; ++i) {
                     const int fd = *reinterpret_cast<const int32_t *>(ufds + i*8);
                     const int16_t ev = *reinterpret_cast<const int16_t *>(ufds + i*8 + 4);
@@ -2686,6 +3016,15 @@ void linux_syscall_dispatch(uint64_t *frame) {
         frame[0] = static_cast<uint64_t>(-38); // -ENOSYS, but quiet
         return;
     }
+    case 124 /*sched_yield*/:
+        // Cooperative yield. The 100 Hz timer tick does the real preemption
+        // (esper_preempt); a plain YIELD lets this core re-pick if another Esper
+        // is ready. Always succeeds (Linux sched_yield returns 0). java's VM
+        // threads call this during spin/shutdown; returning -ENOSYS spammed the
+        // log -- returning 0 is both correct and quiet.
+        asm volatile("yield");
+        frame[0] = 0;
+        return;
     case 153 /*times*/:
     case 165 /*getrusage*/:
         // Quiet "not yet" replies for common timing/accounting syscalls so
@@ -3200,6 +3539,148 @@ void linux_syscall_dispatch(uint64_t *frame) {
         frame[0] = static_cast<uint64_t>(newfd);
         return;
     }
+    case 85 /*timerfd_create*/: {
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const uint32_t flags = static_cast<uint32_t>(frame[1]); // arg0=clockid (CNTPCT-based here)
+        const int tid = timerfd_alloc((flags & 0x800) != 0 /*TFD_NONBLOCK*/);
+        if (tid < 0) { frame[0] = static_cast<uint64_t>(-23); return; }
+        int newfd = -1;
+        for (uint32_t i = 0; i < kMaxFds; ++i)
+            if (me->fds[i].kind == FdKind::closed) { newfd = static_cast<int>(i); break; }
+        if (newfd < 0) { timerfd_close(tid); frame[0] = static_cast<uint64_t>(-24); return; }
+        me->fds[newfd] = Fd{};
+        me->fds[newfd].kind = FdKind::timerfd;
+        me->fds[newfd].sock_idx = tid;
+        frame[0] = static_cast<uint64_t>(newfd);
+        return;
+    }
+    case 86 /*timerfd_settime*/: {
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const uint64_t fd = frame[0];
+        const uint32_t flags = static_cast<uint32_t>(frame[1]); // TFD_TIMER_ABSTIME=1
+        const uint64_t newv = frame[2], oldv = frame[3];
+        if (fd >= kMaxFds || me->fds[fd].kind != FdKind::timerfd) { frame[0] = static_cast<uint64_t>(-9); return; }
+        TimerFd *t = timerfd_at(me->fds[fd].sock_idx);
+        if (t == nullptr || !ensure_user(me, newv, 32)) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const int64_t *its = reinterpret_cast<const int64_t *>(newv);
+        uint64_t freq = 0; asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        if (freq == 0) freq = 62500000;
+        auto ticks = [&](int64_t s, int64_t ns) -> uint64_t {
+            return static_cast<uint64_t>(s) * freq +
+                   (static_cast<uint64_t>(ns) * freq) / 1000000000ull;
+        };
+        if (oldv != 0 && ensure_user(me, oldv, 32))
+            for (uint32_t i = 0; i < 4; ++i) reinterpret_cast<int64_t *>(oldv)[i] = 0;
+        if (its[2] == 0 && its[3] == 0) { t->expire_cnt = 0; t->interval_cnt = 0; } // disarm
+        else {
+            const uint64_t vt = ticks(its[2], its[3]);
+            t->expire_cnt = (flags & 1) ? vt : (read_cntpct() + vt); // ABSTIME: monotonic CNTPCT
+            t->interval_cnt = ticks(its[0], its[1]);
+        }
+        frame[0] = 0;
+        return;
+    }
+    case 87 /*timerfd_gettime*/: {
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const uint64_t fd = frame[0], curv = frame[1];
+        if (fd >= kMaxFds || me->fds[fd].kind != FdKind::timerfd) { frame[0] = static_cast<uint64_t>(-9); return; }
+        TimerFd *t = timerfd_at(me->fds[fd].sock_idx);
+        if (t == nullptr || !ensure_user(me, curv, 32)) { frame[0] = static_cast<uint64_t>(-14); return; }
+        uint64_t freq = 0; asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        if (freq == 0) freq = 62500000;
+        int64_t *its = reinterpret_cast<int64_t *>(curv);
+        its[0] = static_cast<int64_t>(t->interval_cnt / freq);
+        its[1] = static_cast<int64_t>((t->interval_cnt % freq) * 1000000000ull / freq);
+        const uint64_t now = read_cntpct();
+        const uint64_t rem = (t->expire_cnt > now) ? (t->expire_cnt - now) : 0;
+        its[2] = static_cast<int64_t>(rem / freq);
+        its[3] = static_cast<int64_t>((rem % freq) * 1000000000ull / freq);
+        frame[0] = 0;
+        return;
+    }
+    case 74 /*signalfd4*/: {
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const int32_t fd = static_cast<int32_t>(frame[0]);
+        const uint64_t mask_va = frame[1];
+        const uint32_t flags = static_cast<uint32_t>(frame[3]); // SFD_NONBLOCK=0x800
+        uint64_t mask = 0;
+        if (mask_va != 0 && ensure_user(me, mask_va, 8))
+            mask = *reinterpret_cast<const uint64_t *>(mask_va);
+        if (fd >= 0) { // update an existing signalfd's mask
+            if (static_cast<uint32_t>(fd) >= kMaxFds || me->fds[fd].kind != FdKind::signalfd) {
+                frame[0] = static_cast<uint64_t>(-9); return;
+            }
+            SignalFd *s = signalfd_at(me->fds[fd].sock_idx);
+            if (s == nullptr) { frame[0] = static_cast<uint64_t>(-9); return; }
+            s->mask = mask;
+            frame[0] = static_cast<uint64_t>(fd);
+            return;
+        }
+        const int sid = signalfd_alloc(mask, (flags & 0x800) != 0);
+        if (sid < 0) { frame[0] = static_cast<uint64_t>(-23); return; }
+        int newfd = -1;
+        for (uint32_t i = 0; i < kMaxFds; ++i)
+            if (me->fds[i].kind == FdKind::closed) { newfd = static_cast<int>(i); break; }
+        if (newfd < 0) { signalfd_close(sid); frame[0] = static_cast<uint64_t>(-24); return; }
+        me->fds[newfd] = Fd{};
+        me->fds[newfd].kind = FdKind::signalfd;
+        me->fds[newfd].sock_idx = sid;
+        frame[0] = static_cast<uint64_t>(newfd);
+        return;
+    }
+    case 26 /*inotify_init1*/: {
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const uint32_t flags = static_cast<uint32_t>(frame[0]); // IN_NONBLOCK=0x800
+        const int iid = inotify_alloc((flags & 0x800) != 0);
+        if (iid < 0) { frame[0] = static_cast<uint64_t>(-24); return; } // -EMFILE
+        int newfd = -1;
+        for (uint32_t i = 0; i < kMaxFds; ++i)
+            if (me->fds[i].kind == FdKind::closed) { newfd = static_cast<int>(i); break; }
+        if (newfd < 0) { inotify_close(iid); frame[0] = static_cast<uint64_t>(-24); return; }
+        me->fds[newfd] = Fd{};
+        me->fds[newfd].kind = FdKind::inotify;
+        me->fds[newfd].sock_idx = iid;
+        frame[0] = static_cast<uint64_t>(newfd);
+        return;
+    }
+    case 27 /*inotify_add_watch*/: {
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const uint64_t fd = frame[0];
+        const uint64_t path_va = frame[1];
+        const uint32_t mask = static_cast<uint32_t>(frame[2]);
+        if (fd >= kMaxFds || me->fds[fd].kind != FdKind::inotify) { frame[0] = static_cast<uint64_t>(-9); return; }
+        if (!ensure_user(me, path_va, 1)) { frame[0] = static_cast<uint64_t>(-14); return; }
+        Inotify *in = inotify_at(me->fds[fd].sock_idx);
+        if (in == nullptr) { frame[0] = static_cast<uint64_t>(-9); return; }
+        char abs[kCwdCap];
+        if (!resolve_at(me, kAtFdCwd, reinterpret_cast<const char *>(path_va), abs, kCwdCap)) {
+            frame[0] = static_cast<uint64_t>(-2); return; // -ENOENT
+        }
+        // The watch stores the path in kInotifyPathCap bytes; reject one that
+        // would be truncated rather than silently watching the wrong path (a
+        // truncated stored path never matches kazakiri_notify's full dirname, so
+        // events would be lost). Mirrors Linux's NAME_MAX/-ENAMETOOLONG.
+        uint32_t plen = 0; while (abs[plen] != 0) ++plen;
+        if (plen >= kInotifyPathCap) { frame[0] = static_cast<uint64_t>(-36); return; } // -ENAMETOOLONG
+        // Linux requires the watched path to exist (-ENOENT otherwise).
+        LateranEntry st;
+        if (!lateran_is_dir(abs) && !lateran_stat(abs, &st)) {
+            frame[0] = static_cast<uint64_t>(-2); return;
+        }
+        const int wd = inotify_add(in, abs, mask);
+        frame[0] = (wd >= 0) ? static_cast<uint64_t>(wd) : static_cast<uint64_t>(-28); // -ENOSPC
+        return;
+    }
+    case 28 /*inotify_rm_watch*/: {
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const uint64_t fd = frame[0];
+        const int wd = static_cast<int>(frame[1]);
+        if (fd >= kMaxFds || me->fds[fd].kind != FdKind::inotify) { frame[0] = static_cast<uint64_t>(-9); return; }
+        Inotify *in = inotify_at(me->fds[fd].sock_idx);
+        if (in == nullptr) { frame[0] = static_cast<uint64_t>(-9); return; }
+        frame[0] = (inotify_rm(in, wd) == 0) ? 0 : static_cast<uint64_t>(-22); // -EINVAL
+        return;
+    }
     case 20 /*epoll_create1*/: {
         if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
         const int eid = epoll_alloc();
@@ -3269,58 +3750,91 @@ void linux_syscall_dispatch(uint64_t *frame) {
         }
         Epoll *ep = epoll_at(me->fds[epfd].sock_idx);
         if (ep == nullptr) { frame[0] = static_cast<uint64_t>(-9); return; }
-        // Scan registrations for readiness. EPOLLIN (0x1) / EPOLLOUT (0x4) / EPOLLHUP (0x10).
-        auto check_ready = [&](const EpollReg &r) -> uint32_t {
-            if (r.fd < 0 || static_cast<uint32_t>(r.fd) >= kMaxFds) return 0;
-            const FdKind k = me->fds[r.fd].kind;
-            uint32_t ready = 0;
-            if (k == FdKind::file || k == FdKind::devnull ||
-                k == FdKind::devzero || k == FdKind::devrandom) {
-                ready = 0x5; // always readable + writable
-            } else if (k == FdKind::eventfd) {
-                EventFd *ev = eventfd_at(me->fds[r.fd].sock_idx);
-                if (ev) {
-                    if (ev->counter > 0) ready |= 0x1;
-                    ready |= 0x4; // always writable
+        const int pidx = esper_running_index();
+        // epoll_pwait's 5th arg (frame[4]) is a sigmask swapped in for the wait,
+        // exactly like ppoll's. Read it ONCE on first entry and cache across
+        // park-replays (see the long note on ppoll: re-reading per replay raced
+        // SIGCHLD delivery and hung logout).
+        uint64_t eff_mask;
+        if (me->poll_armed) {
+            eff_mask = me->poll_eff_mask;
+        } else {
+            eff_mask = me->sig_mask;
+            if (frame[4] != 0 && ensure_user(me, frame[4], 8))
+                eff_mask = *reinterpret_cast<const uint64_t *>(frame[4]);
+            me->poll_eff_mask = eff_mask;
+        }
+        // Cap events written: a huge maxevents would overflow maxev*12 (#3 class).
+        const uint64_t evcap = (maxev < kEpollMaxRegs) ? maxev : kEpollMaxRegs;
+        for (;;) {
+            // Snapshot poll gen BEFORE scanning so a producer that fires in the
+            // check-then-park window is caught by poll_gen_changed (lost-wakeup
+            // free, mirrors ppoll). timerfd/signalfd are time-/signal-driven and
+            // don't bump the gen -- the 100 Hz network_tick EpollWait re-kick is
+            // what re-checks them, plus the deadline below bounds the wait.
+            const uint32_t gen0 = linux_poll_gen();
+            // A signal deliverable under eff_mask interrupts the wait with -EINTR
+            // and runs its handler (mirrors ppoll's reaper path).
+            {
+                const uint64_t deliverable = me->sig_pending & ~eff_mask;
+                if (deliverable != 0) {
+                    const int sig = __builtin_ctzll(deliverable) + 1;
+                    frame[0] = static_cast<uint64_t>(-4); // -EINTR
+                    if (linux_deliver_signal(me, sig, frame)) {
+                        me->poll_armed = false;
+                        return; // handler entered; yields -EINTR via sigreturn
+                    }
+                    frame[0] = epfd; // delivery failed: restore arg0 for park-replay
+                    const uint64_t h = me->sig_handler[sig];
+                    if (h == 0 /*SIG_DFL*/ || h == 1 /*SIG_IGN*/)
+                        me->sig_pending &= ~(1ULL << (sig - 1));
                 }
-            } else if (k == FdKind::socket || k == FdKind::unix_sock) {
-                // Treat established+data as IN, established as OUT. We don't
-                // distinguish UDP-vs-TCP precisely here; programs poll for IN
-                // and read.
-                ready = 0x5;
-            } else if (k == FdKind::pipe_read) {
-                ready = 0x1;
-            } else if (k == FdKind::pipe_write) {
-                ready = 0x4;
-            } else if (k == FdKind::console || k == FdKind::devtty) {
-                ready = 0x5;
             }
-            return ready & r.events;
-        };
-        uint64_t count = 0;
-        if (ensure_user(me, out_va, maxev * 12)) {
-            uint8_t *out = reinterpret_cast<uint8_t *>(out_va);
-            for (uint32_t i = 0; i < kEpollMaxRegs && count < maxev; ++i) {
-                const uint32_t r = check_ready(ep->regs[i]);
-                if (r != 0) {
-                    *reinterpret_cast<uint32_t *>(out + count * 12) = r;
-                    *reinterpret_cast<uint64_t *>(out + count * 12 + 4) = ep->regs[i].data;
-                    ++count;
+            // Scan registrations through the single readiness source of truth
+            // (linux_fd_revents) so timerfd/signalfd/every fd kind are handled
+            // identically to poll() -- the old hand-rolled table here silently
+            // omitted timerfd, so an epoll on a timerfd never woke.
+            uint64_t count = 0;
+            if (out_va != 0 && out_va < 0x8000000000ULL &&
+                ensure_user(me, out_va, evcap * 12)) {
+                uint8_t *out = reinterpret_cast<uint8_t *>(out_va);
+                for (uint32_t i = 0; i < kEpollMaxRegs && count < maxev; ++i) {
+                    const EpollReg &rg = ep->regs[i];
+                    if (rg.fd < 0 || static_cast<uint32_t>(rg.fd) >= kMaxFds) continue;
+                    if (me->fds[rg.fd].kind == FdKind::closed) continue;
+                    uint32_t re = linux_fd_revents(me, rg.fd);
+                    re &= rg.events | 0x18u; // EPOLLERR|EPOLLHUP reported regardless
+                    if (re != 0) {
+                        *reinterpret_cast<uint32_t *>(out + count * 12) = re;
+                        *reinterpret_cast<uint64_t *>(out + count * 12 + 4) = rg.data;
+                        ++count;
+                    }
                 }
             }
+            if (count > 0) { me->poll_armed = false; frame[0] = count; return; }
+            if (timeout_ms == 0) { me->poll_armed = false; frame[0] = 0; return; }
+            // Arm the timeout once; it must survive park-replays (each wake re-runs
+            // this syscall from the top). last_order_ticks() is 100 Hz = 10 ms/tick.
+            if (!me->poll_armed) {
+                me->poll_armed = true;
+                me->poll_deadline = (timeout_ms < 0) ? 0 /*infinite*/
+                    : (last_order_ticks() + static_cast<uint64_t>(timeout_ms) / 10 + 1);
+            }
+            if (me->poll_deadline != 0 && last_order_ticks() >= me->poll_deadline) {
+                me->poll_armed = false; frame[0] = 0; return; // timed out
+            }
+            if (pidx < 0) { me->poll_armed = false; frame[0] = 0; return; }
+            // Park only if no producer fired since gen0 and no eff_mask-deliverable
+            // signal is pending (re-checked atomically under g_esper_lock). The
+            // 100 Hz network_tick wildcard EpollWait wake replays us so a timerfd
+            // deadline that passes while parked is noticed on the next tick.
+            if (ipc_park_unless_ready(pidx, Esper::IpcWaitKind::EpollWait,
+                                      static_cast<int>(gen0), frame,
+                                      poll_gen_changed, eff_mask)) {
+                return; // parked; svc replays the epoll_pwait on wake
+            }
+            // gen changed in the park window -> re-scan (loop).
         }
-        if (count > 0 || timeout_ms == 0) {
-            frame[0] = count;
-            return;
-        }
-        // Nothing ready, blocking call: park on EpollWait.
-        const int pid = esper_running_index();
-        if (pid >= 0 && linux_ipc_park(pid, Esper::IpcWaitKind::EpollWait,
-                                        me->fds[epfd].sock_idx, frame) >= 0) {
-            return; // svc replays; the loop above will run again
-        }
-        frame[0] = 0;
-        return;
     }
     case 199 /*socketpair*/: {
         if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
@@ -3413,7 +3927,7 @@ void linux_syscall_dispatch(uint64_t *frame) {
         // small; a short write just makes the caller send the rest).
         uint8_t stage[2048];
         uint32_t total = 0;
-        if (iov_va != 0 && iovlen > 0 && ensure_user(me, iov_va, iovlen * 16)) {
+        if (iov_va != 0 && iovlen > 0 && iovlen <= 1024 && ensure_user(me, iov_va, iovlen * 16)) {
             const uint8_t *iov = reinterpret_cast<const uint8_t *>(iov_va);
             for (uint64_t i = 0; i < iovlen && total < sizeof(stage); ++i) {
                 const uint64_t base = *reinterpret_cast<const uint64_t *>(iov + i * 16);
@@ -3479,7 +3993,7 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint64_t ctrllen = *reinterpret_cast<const uint64_t *>(mh + 0x28);
 
         uint64_t cap = 0;
-        if (iov_va != 0 && iovlen > 0 && ensure_user(me, iov_va, iovlen * 16)) {
+        if (iov_va != 0 && iovlen > 0 && iovlen <= 1024 && ensure_user(me, iov_va, iovlen * 16)) {
             const uint8_t *iov = reinterpret_cast<const uint8_t *>(iov_va);
             for (uint64_t i = 0; i < iovlen; ++i)
                 cap += *reinterpret_cast<const uint64_t *>(iov + i * 16 + 8);
@@ -3573,10 +4087,17 @@ void linux_syscall_dispatch(uint64_t *frame) {
         // (DUMPABLE/KEEPCAPS/NO_NEW_PRIVS) from aborting it.
         if (frame[0] == 15 /*PR_SET_NAME*/ && me != nullptr) {
             const uint64_t va = frame[1];
-            if (ensure_user(me, va, 16)) {
+            // PR_SET_NAME's buffer is TASK_COMM_LEN (16) bytes; we validate and
+            // read at most that many. me->name is wider (24), so the loop bound
+            // must be the VALIDATED 16 -- not sizeof(me->name)-1 (=23), which would
+            // read up to 7 bytes past the ensure_user'd region for a name with no
+            // NUL in the first 16 bytes (EL1 fault / same-process info leak).
+            constexpr uint32_t kTaskCommLen = 16;
+            if (ensure_user(me, va, kTaskCommLen)) {
                 const char *src = reinterpret_cast<const char *>(va);
                 uint32_t i = 0;
-                for (; i < sizeof(me->name) - 1 && src[i]; ++i) me->name[i] = src[i];
+                for (; i < kTaskCommLen - 1 && i < sizeof(me->name) - 1 && src[i]; ++i)
+                    me->name[i] = src[i];
                 me->name[i] = 0;
             }
         }

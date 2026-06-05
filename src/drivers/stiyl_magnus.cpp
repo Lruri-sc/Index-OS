@@ -248,7 +248,12 @@ bool do_version() {
     for (uint32_t i = 0; i < 8; ++i) {
         if (g_rx[ro + i] != static_cast<uint8_t>(want[i])) return false;
     }
-    g_dev.msize = msize;
+    // Clamp the server's negotiated msize to our actual transport buffer: a
+    // (malicious/buggy) 9P server could reply with msize > kBufSize, and msize
+    // bounds later request/response framing into the fixed g_tx/g_rx[kBufSize].
+    // Real 9P clients clamp to their own buffer the same way (RX writes are also
+    // virtq-descriptor-bounded, but don't rely on that alone).
+    g_dev.msize = (msize < kBufSize) ? msize : kBufSize;
     return true;
 }
 

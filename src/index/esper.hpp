@@ -48,7 +48,12 @@ constexpr uint8_t kVmaProtR = 1; // readable from EL0
 constexpr uint8_t kVmaProtW = 2; // writable from EL0
 constexpr uint8_t kVmaProtX = 4; // executable from EL0
 
-constexpr uint32_t kMaxVmas = 32;
+// 32 sufficed for busybox/sshd, but a JVM maps far more regions: ~10 shared
+// libs (each several PT_LOADs, now further split by RELRO mprotect), the Java
+// heap + metaspace + code cache, and a VMA per thread stack + many malloc
+// mmaps. 32 exhausted -> mmap -ENOMEM -> "Unable to load libjava.so: Out of
+// memory". Bumped to 512 (Vma ~56 B * 512 * kMaxEspers ~ 0.5 MiB bss).
+constexpr uint32_t kMaxVmas = 512;
 
 struct Vma {
     uint64_t start = 0;          // inclusive (page-aligned)
@@ -64,6 +69,37 @@ struct Vma {
     uint64_t seg_pad = 0;        // bytes between start and the segment's actual VA
     uint8_t prot = 0;            // bitmask of kVmaProtR/W/X
     VmaKind kind = VmaKind::Free;
+    // Demand-paged file-backed mmap: when file_src==nullptr but file_path[0]!=0,
+    // the fault handler reads each page from this path via lateran_pread instead
+    // of pre-reading the whole file into the kernel heap (so a 33 MB rt.jar costs
+    // no heap and isn't bounded by the old 8-buffer table). ELF segments leave
+    // this empty and use the resident file_src buffer.
+    char file_path[96] = {};
+};
+
+// PersonalReality (パーソナルリアリティ): an esper's private, self-consistent
+// world -- the very source of its power. Here it is a refcounted address space,
+// the Index analogue of Linux's mm_struct. The VMA list + brk/mmap bookkeeping
+// + page-table base (ttbr0) live
+// HERE, jointly owned by every thread (CLONE_VM Esper) that shares the space,
+// rather than being duplicated in each Esper. This gives all threads ONE
+// authoritative VMA map (a region mmap'd by any thread is instantly visible to
+// its siblings -- the fix for the CLONE_VM "VMA list divergence" that killed
+// the multi-threaded JVM) and ties the map's lifetime to the address space, not
+// to any single thread's Esper slot. `refs` counts sharers: fork() makes a
+// fresh one (refs=1), clone(CLONE_VM) shares the parent's (refs++). When the
+// last sharer exits and refs hits 0 the page tables are reclaimed
+// (pr2_destroy). Allocated from a fixed pool (reality_alloc); see
+// personal_reality_v2.
+struct PersonalReality {
+    uint64_t ttbr0 = 0;          // L1 phys (page-table base); the authoritative copy
+    Vma vmas[kMaxVmas] = {};      // the VMA list shared by all threads in this space
+    uint32_t vma_count = 0;
+    uint64_t brk_start = 0;       // base of the heap (Brk) VMA
+    uint64_t brk_cur = 0;         // current program break
+    uint64_t mmap_next = 0;       // bump pointer for anonymous mmap()
+    int32_t refs = 0;             // sharer count (threads); 0 => slot free
+    bool in_use = false;          // pool-slot occupancy
 };
 
 // A per-Esper file descriptor. 0/1/2 are the console; open() hands out file
@@ -78,6 +114,9 @@ enum class FdKind { closed, console, file, pipe_read, pipe_write, socket,
                      unix_sock /*AF_UNIX via ImaginaryNumberChannel*/,
                      eventfd /*eventfd2 u64 counter*/,
                      epoll /*epoll_create1 set*/,
+                     timerfd /*timerfd_create: CNTPCT deadline -> readable*/,
+                     signalfd /*signalfd4: pending signals -> readable*/,
+                     inotify /*inotify_init1: Kazakiri FS-watch event queue*/,
                      pty_master /*master end of a SisterRelay pair*/,
                      pty_slave  /*slave end (looks like a tty)*/ };
 struct Fd {
@@ -100,12 +139,21 @@ constexpr uint32_t kCwdCap = 256;
 // reads from here so kSysExec and the kernel shell's `linuxrun` can hand the
 // new Linux process a real (argc, argv, envp). exec_argv[0..exec_argc) are
 // borrowed pointers that must stay valid through load_elf_into_slot.
-constexpr uint32_t kExecArgvCap = 16;
-constexpr uint32_t kExecEnvpCap = 8;
+// Bumped well past a shell's needs for the OpenJDK launcher: `java -cp ... Main
+// args...` has many argv, and the launcher re-execs itself after setenv'ing
+// LD_LIBRARY_PATH -- if envp is truncated below where LD_LIBRARY_PATH lands, the
+// re-exec'd java never sees it, re-sets it, and re-execs forever (infinite loop).
+constexpr uint32_t kExecArgvCap = 64;
+constexpr uint32_t kExecEnvpCap = 64;
 
 struct Esper {
     uint32_t pid = 0;
     char name[24] = {};
+    // Full path of the running program image (absolute), set by load_elf_into_slot
+    // and inherited across fork/clone. Backs readlink("/proc/self/exe"), which the
+    // musl dynamic loader reads to resolve $ORIGIN in a binary's RUNPATH (the
+    // OpenJDK launcher's libjli.so lives at $ORIGIN/../lib/aarch64/jli).
+    char exe_path[kCwdCap] = {};
 
     // Process group + session. fork inherits both; setsid sets sid=pid and
     // pgrp=pid (becomes a session leader without a controlling tty); setpgid
@@ -167,9 +215,18 @@ struct Esper {
     // raw int64 code that Index wait() writes.
     bool wait_status_is_linux = false;
     // True for an Esper created by clone(CLONE_VM) -- a thread sharing its
-    // creator's address space. Its ttbr0/VMAs/images are shared, so teardown
-    // must not free them while siblings still run (images are refcounted).
+    // creator's address space. Its mm/images are shared, so teardown must not
+    // free them while siblings still run (mm is refcounted, images too).
     bool is_thread = false;
+    // The address space (Linux mm_struct analogue): the VMA list, brk/mmap
+    // bookkeeping and the authoritative ttbr0 all live in this shared,
+    // refcounted PersonalReality. Every thread that shares the space (CLONE_VM)
+    // points at the SAME PersonalReality, so they all see one consistent VMA
+    // map. nullptr for an Index legacy-pool Esper, which has no VMA list --
+    // ensure_user treats a null mm as "already fully mapped" (this replaces the
+    // old vma_count==0 sentinel). e->ttbr0 mirrors mm->ttbr0 as a fast-path
+    // cache so the context-switch path needn't dereference mm.
+    PersonalReality *mm = nullptr;
     // Thread bookkeeping (Wave F4). clear_child_tid: if non-zero, on exit the
     // kernel writes 0 to *clear_child_tid and futex-wakes it (waking a joiner
     // in pthread_join). wait_futex/wait_futex_phys mark an Esper blocked in
@@ -240,6 +297,11 @@ struct Esper {
                              // network_tick after the NIC is drained -- a
                              // generic "something may be ready" tick, exactly
                              // how Linux poll() is driven by scheduler+softirq.
+        InotifyRead = 13,    // inotify (Kazakiri) fd id; wake when an FS
+                             // mutation queues an event (kazakiri_notify).
+        PtraceStop = 14,     // ptrace (Mental Out) stop: tracee parked here is
+                             // NOT woken by any generic path -- only the tracer's
+                             // PTRACE_CONT/SYSCALL/SINGLESTEP/DETACH resumes it.
     };
     IpcWaitKind ipc_wait_kind = IpcWaitKind::None;
     int ipc_wait_id = -1;
@@ -273,11 +335,9 @@ struct Esper {
     uint64_t elf_base = 0;
     uint64_t elf_entry = 0;
 
-    // Phase B per-process VMA list. Populated by pr2_create_addr_space + the
-    // Linux ELF loader; consulted by pr2_handle_fault. Free entries have
-    // kind=Free. Index Espers ignore this and use the legacy pool layout.
-    Vma vmas[kMaxVmas] = {};
-    uint32_t vma_count = 0;
+    // (The per-process VMA list now lives in the shared PersonalReality `mm`
+    // above -- see struct PersonalReality. A null mm == an Index legacy-pool
+    // Esper with no VMA list.)
     // The Esper's ELF file image (kept alive while the Esper is running so
     // file-backed VMAs can keep reading bytes out of it on each fault). Owned
     // by the Esper -- freed on exec/exit. Index Espers leave this null.
@@ -287,22 +347,10 @@ struct Esper {
     // (ld-musl) ELF image, kept resident the same way (its file-backed VMAs
     // read from it on fault). Null for static binaries and Index Espers.
     uint8_t *linux_interp_image = nullptr;
-    // Buffers holding file contents for file-backed mmap()s (the File VMA's
-    // file_src points into these). Kept resident until the Esper exits.
-    // Each entry is keyed by the file path so multiple mmaps of the same file
-    // share one buffer -- ld-musl's PT_LOAD layout creates 2-3 mmap calls per
-    // .so and the per-call 4 MiB scratch added up to OOM on a 16 MiB heap.
-    uint8_t *mmap_bufs[8] = {};
-    char mmap_buf_paths[8][96] = {};
-    uint64_t mmap_buf_sizes[8] = {};
-    uint32_t mmap_buf_count = 0;
-    // Linux brk()/mmap() bookkeeping. brk_start is the base of the heap VMA
-    // (just past the last PT_LOAD); brk_cur is the current break. mmap_next is
-    // a bump pointer in the mmap region for anonymous mappings. All zero for
-    // Index Espers.
-    uint64_t brk_start = 0;
-    uint64_t brk_cur = 0;
-    uint64_t mmap_next = 0;
+    // (file-backed mmap is demand-paged now -- pages fault in from the
+    // filesystem via lateran_pread; no per-Esper whole-file buffers, no 8-cap.)
+    // (brk/mmap bookkeeping -- brk_start/brk_cur/mmap_next -- moved into the
+    // shared PersonalReality `mm` so all threads share one heap + mmap arena.)
 
     // Linux signal handling (Wave F2). Per-signal user-handler VA (0 = SIG_DFL,
     // 1 = SIG_IGN), the program's restorer trampoline (musl's __restore_rt),
@@ -318,6 +366,25 @@ struct Esper {
     // and SIGSTOP (19) can't be masked and are always delivered immediately.
     uint64_t sig_mask = 0;
     uint64_t sig_pending = 0;
+
+    // ptrace "Mental Out": debugger control of another Esper. A tracee records
+    // its tracer; a ptrace-stop parks the tracee (state=waiting, ipc_wait_kind=
+    // PtraceStop -- nothing generic wakes that kind, only the tracer's CONT/etc.)
+    // and reports to the tracer's wait4. See mental_out.cpp.
+    int ptrace_tracer = -1;        // tracer's Esper slot, or -1 (not traced)
+    bool ptrace_stopped = false;   // currently in a ptrace-stop (parked)
+    bool ptrace_report = false;    // a stop is pending for the tracer's wait4
+    uint32_t ptrace_options = 0;   // PTRACE_O_* (only TRACESYSGOOD acted on)
+    uint32_t ptrace_event = 0;     // event code for the current stop (PTRACE_EVENT_*)
+    int32_t ptrace_stop_sig = 0;   // signal/cause reported by the current stop
+    int32_t ptrace_pending_stop = 0; // a signal that must trigger a stop at the next safe point (0 = none)
+    bool ptrace_syscall = false;   // resumed via PTRACE_SYSCALL: stop at next syscall entry/exit
+    bool ptrace_singlestep = false;// resumed via PTRACE_SINGLESTEP
+    bool ptrace_in_syscall = false;// syscall-stop toggle: false=>next stop is entry, true=>exit
+    int32_t ptrace_inject_sig = 0; // signal to deliver to the tracee on resume (CONT/SYSCALL data arg)
+    // Tracer-side: a stopped tracee reports a Linux WSTOPPED status. Reuses the
+    // wait machinery but needs the (sig<<8)|0x7f encoding (vs exit's (code&0xff)<<8).
+    bool wait_status_is_stop = false;
 
     Fd fds[kMaxFds] = {};    // 0/1/2 set to console by esper_create
 
@@ -414,6 +481,15 @@ int esper_preempt_and_pick(int cur_idx);
 // IPC / futex blocker is NOT wrongly woken), and picks+claims the next
 // Esper. Returns next idx, or -1 if no one runnable (caller does leave_user).
 int esper_exit_and_pick(int me_idx, int64_t code);
+// Thread-group exit for a fatal signal (SIGSEGV) in one CLONE_VM thread: marks
+// every Esper sharing `mm` exited + wakes their parents, then picks next once.
+int esper_group_exit_and_pick(int fault_idx, const void *mm, int64_t code);
+
+// ptrace "Mental Out": detach all tracees of a dying tracer (slot dead_tracer)
+// so none is orphaned (a ptrace-stopped tracee would never resume otherwise).
+// Untraces each + wakes any that is stopped. Caller MUST hold g_esper_lock.
+// Called from every tracer-death path (exit, fault, fatal-signal kill).
+void esper_detach_tracees_locked(int dead_tracer);
 
 // Same as exit_and_pick but transitions to faulted (parent is NOT woken --
 // matches existing single-core behaviour where esper_fault never woke

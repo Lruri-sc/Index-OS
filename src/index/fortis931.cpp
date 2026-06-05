@@ -60,7 +60,10 @@ KillAction kill_one_locked(Esper *t, int sig) {
         // for back-compat with the legacy single-core code path (a parent
         // in nanosleep/IPC/futex has wait_pipe_idx==-1 too -- pre-existing
         // hazard; out of scope for SMP locking).
-        if (p != nullptr && p->state == EsperState::waiting && p->wait_pipe_idx < 0) {
+        if (p != nullptr && p->state == EsperState::waiting && p->wait_pipe_idx < 0 &&
+            p->ipc_wait_kind != Esper::IpcWaitKind::PtraceStop) {
+            // ...but never a ptrace-stopped parent: only its tracer may resume it
+            // (waking it here would let it run before the tracer authorised it).
             p->regs[0] = t->pid;
             p->pending_status = t->exit_code;
             p->has_pending_status = (p->wait_status_ptr != 0);
@@ -101,6 +104,7 @@ int fortis931_kill_pgrp(uint32_t pgrp, int sig) {
             }
             if (act == KillAction::Killed) {
                 to_release[to_release_n++] = e;
+                esper_detach_tracees_locked(static_cast<int>(i)); // dying tracer -> don't orphan tracees
             }
         }
         anti_skill_unlock_irqrestore(g_esper_lock, flags);
@@ -120,6 +124,9 @@ bool fortis931_kill(int target_slot, int sig) {
     {
         const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
         act = kill_one_locked(t, sig);
+        if (act == KillAction::Killed) {
+            esper_detach_tracees_locked(target_slot); // dying tracer -> don't orphan tracees
+        }
         anti_skill_unlock_irqrestore(g_esper_lock, flags);
     }
     if (act == KillAction::Killed) {

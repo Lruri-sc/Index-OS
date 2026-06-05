@@ -13,9 +13,32 @@ bool valid(int idx) {
     return idx >= 0 && static_cast<uint32_t>(idx) < kMaxAiwass && g_pipes[idx].in_use;
 }
 
+// CAS dec-if-positive for the cross-core ref counts (a fork inherits the pipe fd
+// and bumps the ref on the forking core while a concurrent close drops it on
+// another -- a plain --/++ is a torn RMW: lost decrement leaks the slot, lost
+// increment frees it early under a peer = UAF). Mirrors Linux file->f_count.
+uint32_t pipe_ref_dec(uint32_t &v) {
+    uint32_t cur = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    while (cur > 0) {
+        if (__atomic_compare_exchange_n(&v, &cur, cur - 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return cur - 1;
+    }
+    return 0;
+}
+
 void maybe_free(int idx) {
     Aiwass &p = g_pipes[idx];
-    if (p.read_refs == 0 && p.write_refs == 0) {
+    if (__atomic_load_n(&p.read_refs, __ATOMIC_ACQUIRE) != 0 ||
+        __atomic_load_n(&p.write_refs, __ATOMIC_ACQUIRE) != 0) {
+        return;
+    }
+    // Both ends closed. Two cores dropping the last read end and last write end
+    // concurrently both reach here with refs==0; claim the slot exactly once via
+    // a CAS on in_use so dark_matter_free(buf) cannot run twice (double-free).
+    bool expected = true;
+    if (__atomic_compare_exchange_n(&p.in_use, &expected, false, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
         if (p.buf != nullptr) {
             dark_matter_free(p.buf);
         }
@@ -65,26 +88,26 @@ Aiwass *aiwass_at(int idx) {
 
 void aiwass_inc_read(int idx) {
     if (valid(idx)) {
-        ++g_pipes[idx].read_refs;
+        __atomic_add_fetch(&g_pipes[idx].read_refs, 1, __ATOMIC_ACQ_REL);
     }
 }
 
 void aiwass_inc_write(int idx) {
     if (valid(idx)) {
-        ++g_pipes[idx].write_refs;
+        __atomic_add_fetch(&g_pipes[idx].write_refs, 1, __ATOMIC_ACQ_REL);
     }
 }
 
 void aiwass_close_read(int idx) {
-    if (valid(idx) && g_pipes[idx].read_refs > 0) {
-        --g_pipes[idx].read_refs;
-        maybe_free(idx);
+    if (valid(idx)) {
+        pipe_ref_dec(g_pipes[idx].read_refs); // atomic dec-if-positive
+        maybe_free(idx);                      // CAS-claims in_use -> frees once
     }
 }
 
 void aiwass_close_write(int idx) {
-    if (valid(idx) && g_pipes[idx].write_refs > 0) {
-        --g_pipes[idx].write_refs;
+    if (valid(idx)) {
+        pipe_ref_dec(g_pipes[idx].write_refs);
         maybe_free(idx);
     }
 }

@@ -6,6 +6,7 @@
 #include "index/anti_skill.hpp" // serialise the shared ext2/lateran block scratch
 #include "index/ext2.hpp"
 #include "index/procfs.hpp"
+#include "index/testament.hpp" // tmpfs (in-memory) mounts: /tmp, /dev/shm
 
 namespace {
 // "/host" / "/host/foo" -> "/foo" / "" routed to StiylMagnus (virtio-9p).
@@ -457,6 +458,7 @@ uint32_t lateran_list(LateranEntry *out, uint32_t max) {
 
 int64_t lateran_read_file(const char *name, char *buf, uint32_t cap) {
     FsGuard _g;
+    if (tmpfs_owns_path(name)) return tmpfs_read_file(name, buf, cap);
     if (const char *sub = strip_host_prefix(name)) {
         return drivers::stiyl_read_file(sub, buf, cap);
     }
@@ -513,8 +515,20 @@ int64_t lateran_read_file(const char *name, char *buf, uint32_t cap) {
     return static_cast<int64_t>(written);
 }
 
+// Demand-paging read primitive (file-backed mmap fault path). Routes like
+// lateran_read_file but seeks to `offset`. ext2 + tmpfs support it; host-9p /
+// FAT return -1 (those mmaps still slurp the whole file via lateran_read_file).
+int64_t lateran_pread(const char *name, uint64_t offset, char *buf, uint32_t len) {
+    FsGuard _g;
+    if (tmpfs_owns_path(name)) return tmpfs_pread(name, offset, buf, len);
+    if (procfs_owns_path(name)) return -1; // synthesized, not mmap-backed
+    if (g_backend == Backend::ext2) return ext2_pread(name, offset, buf, len);
+    return -1;
+}
+
 int64_t lateran_write_file(const char *name, const char *buf, uint32_t len) {
     FsGuard _g;
+    if (tmpfs_owns_path(name)) return tmpfs_write_file(name, buf, len);
     if (const char *sub = strip_host_prefix(name)) {
         return drivers::stiyl_write_file(sub, buf, len);
     }
@@ -578,6 +592,8 @@ int64_t lateran_write_file(const char *name, const char *buf, uint32_t len) {
 
 bool lateran_unlink(const char *name) {
     FsGuard _g;
+    // unlinkat ignores AT_REMOVEDIR, so this removes both files and empty dirs.
+    if (tmpfs_owns_path(name)) return tmpfs_is_dir(name) ? tmpfs_rmdir(name) : tmpfs_unlink(name);
     if (const char *sub = strip_host_prefix(name)) {
         return drivers::stiyl_unlink(sub);
     }
@@ -606,6 +622,7 @@ bool lateran_unlink(const char *name) {
 
 bool lateran_mkdir(const char *path) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_mkdir(path);
     if (g_backend == Backend::ext2) {
         return ext2_mkdir(path);
     }
@@ -657,6 +674,7 @@ bool lateran_mkdir(const char *path) {
 
 bool lateran_stat(const char *path, LateranEntry *out) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_stat(path, out);
     if (const char *sub = strip_host_prefix(path)) {
         return drivers::stiyl_stat(sub, out);
     }
@@ -697,24 +715,29 @@ bool lateran_stat(const char *path, LateranEntry *out) {
 
 int32_t lateran_readlink(const char *path, char *out, uint32_t cap) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_readlink(path, out, cap);
     if (g_backend == Backend::ext2) return ext2_readlink(path, out, cap);
     return -1; // FAT has no symlinks
 }
 
 bool lateran_symlink(const char *target, const char *path) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_symlink(target, path);
     if (g_backend == Backend::ext2) return ext2_symlink(target, path);
     return false;
 }
 
 bool lateran_rename(const char *old_path, const char *new_path) {
     FsGuard _g;
+    if (tmpfs_owns_path(old_path) || tmpfs_owns_path(new_path))
+        return tmpfs_rename(old_path, new_path); // cross-fs rename unsupported -> false
     if (g_backend == Backend::ext2) return ext2_rename(old_path, new_path);
     return false;
 }
 
 bool lateran_truncate(const char *path, uint64_t new_size) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_truncate(path, new_size);
     if (const char *sub = strip_host_prefix(path)) {
         return drivers::stiyl_truncate(sub, new_size);
     }
@@ -724,30 +747,45 @@ bool lateran_truncate(const char *path, uint64_t new_size) {
 
 bool lateran_chmod(const char *path, uint32_t new_mode) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_chmod(path, new_mode);
     if (g_backend == Backend::ext2) return ext2_chmod(path, new_mode);
     return false;
 }
 
 bool lateran_chown(const char *path, uint32_t uid, uint32_t gid) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_chown(path, uid, gid);
     if (g_backend == Backend::ext2) return ext2_chown(path, uid, gid);
     return false;
 }
 
 bool lateran_link(const char *target, const char *link_path) {
     FsGuard _g;
+    if (tmpfs_owns_path(link_path) || tmpfs_owns_path(target)) return false; // tmpfs: no hard links
     if (g_backend == Backend::ext2) return ext2_link(target, link_path);
     return false;
 }
 
 bool lateran_utime(const char *path, int64_t atime, int64_t mtime) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_utime(path, atime, mtime);
     if (g_backend == Backend::ext2) return ext2_utime(path, atime, mtime);
     return false;
 }
 
+bool lateran_tmpfs_mount(const char *point) {
+    FsGuard _g;
+    return testament_mount(point);
+}
+
+bool lateran_tmpfs_umount(const char *point) {
+    FsGuard _g;
+    return testament_umount(point);
+}
+
 bool lateran_is_dir(const char *path) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_is_dir(path);
     if (const char *sub = strip_host_prefix(path)) {
         return drivers::stiyl_is_dir(sub);
     }
@@ -773,6 +811,7 @@ bool lateran_is_dir(const char *path) {
 
 uint32_t lateran_list_dir(const char *path, LateranEntry *out, uint32_t max) {
     FsGuard _g;
+    if (tmpfs_owns_path(path)) return tmpfs_list_dir(path, out, max);
     if (const char *sub = strip_host_prefix(path)) {
         return drivers::stiyl_list_dir(sub, out, max);
     }

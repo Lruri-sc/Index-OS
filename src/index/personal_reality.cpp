@@ -54,9 +54,9 @@ void zero_page(uint8_t *p) {
 
 } // namespace
 
-PersonalReality personal_reality_build(uint32_t slot, const uint8_t *image,
+PersonalRealityV1 personal_reality_build(uint32_t slot, const uint8_t *image,
                                        uint64_t image_size) {
-    PersonalReality pr;
+    PersonalRealityV1 pr;
     if (slot >= kMaxEspers) {
         return pr;
     }
@@ -116,9 +116,9 @@ PersonalReality personal_reality_build(uint32_t slot, const uint8_t *image,
     return pr;
 }
 
-PersonalReality personal_reality_fork(uint32_t parent_slot, uint32_t child_slot,
+PersonalRealityV1 personal_reality_fork(uint32_t parent_slot, uint32_t child_slot,
                                       uint32_t code_pages) {
-    PersonalReality pr;
+    PersonalRealityV1 pr;
     if (parent_slot >= kMaxEspers || child_slot >= kMaxEspers ||
         code_pages > kMaxCodePages) {
         return pr;

@@ -97,7 +97,7 @@ int antenna_socket_udp() {
 }
 
 void antenna_inc_ref(int idx) {
-    if (valid(idx)) ++g_ants[idx].refs;
+    if (valid(idx)) __atomic_add_fetch(&g_ants[idx].refs, 1, __ATOMIC_ACQ_REL);
 }
 
 bool antenna_bind(int idx, uint16_t port) {
@@ -215,10 +215,23 @@ uint32_t antenna_poll(int idx) {
     return re;
 }
 
+// Atomic CAS dec-if-positive (refcount_t style); returns the new value. refs is
+// RMW'd cross-core: fork/dup3 bump it on one core while close drops it on
+// another, so a plain --/++ is a torn RMW (lost decrement => socket slot leak;
+// lost increment => freed early under a peer = UAF). Mirrors Linux f_count.
+static uint16_t ant_ref_dec(uint16_t &v) {
+    uint16_t cur = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    while (cur > 0) {
+        if (__atomic_compare_exchange_n(&v, &cur, static_cast<uint16_t>(cur - 1),
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return static_cast<uint16_t>(cur - 1);
+    }
+    return 0;
+}
+
 void antenna_close(int idx) {
     if (!valid(idx)) return;
-    if (g_ants[idx].refs > 0) --g_ants[idx].refs;
-    if (g_ants[idx].refs == 0) {
+    if (ant_ref_dec(g_ants[idx].refs) == 0) {
         // For TCP, run the active-close handshake (best effort) before freeing
         // the slot so the peer sees a proper FIN instead of just going away.
         if (g_ants[idx].proto == AntennaProto::Tcp &&

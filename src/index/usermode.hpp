@@ -132,11 +132,8 @@ bool linux_execve_replace(int idx, const char *path, const char *const *argv,
                           uint32_t argc, const char *const *envp, uint32_t envc,
                           uint64_t *frame);
 
-// Read the whole file behind open fd `fd` into a fresh buffer that stays
-// resident until the Esper exits (tracked in e->mmap_bufs), for file-backed
-// mmap. Returns the buffer and sets *out_size to the file size, or nullptr on
-// failure (bad fd / out of heap / too many mmaps).
-uint8_t *linux_file_mmap_buf(Esper *e, uint32_t fd, uint64_t *out_size);
+// (linux_file_mmap_buf removed: file-backed mmap is demand-paged -- pages fault
+// in via lateran_pread; see pr2_handle_fault / mmap case 222.)
 
 // Run the embedded EL0 user program (prints via syscalls, then exits).
 void run_user();

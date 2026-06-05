@@ -20,6 +20,7 @@ bool ext2_mount();                  // true if the disk holds an ext2 volume
 bool ext2_mounted();
 
 int64_t ext2_read_file(const char *path, char *buf, uint32_t cap);
+int64_t ext2_pread(const char *path, uint64_t offset, char *buf, uint32_t len); // demand-paging read
 uint32_t ext2_list_dir(const char *path, LateranEntry *out, uint32_t max);
 bool ext2_is_dir(const char *path);
 

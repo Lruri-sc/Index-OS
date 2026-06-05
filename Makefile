@@ -234,6 +234,47 @@ $(BUILD_DIR)/sigtest.elf: userprog/sigtest.c | $(BUILD_DIR)
 	$(ZIG) cc -target aarch64-linux-musl -dynamic -Os -o $@ $<
 	$(STRIP) $@
 
+# timerfd + signalfd + epoll functional test (static musl). Prints TIMERFD_OK /
+# SIGFD_OK so a boot harness can grep for them.
+$(BUILD_DIR)/epolltest.elf: userprog/epolltest.c | $(BUILD_DIR)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -o $@ $<
+	$(STRIP) $@
+
+# A musl program that watches /tmp via inotify and verifies CREATE/MODIFY/DELETE.
+$(BUILD_DIR)/inotifytest.elf: userprog/inotifytest.c | $(BUILD_DIR)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -o $@ $<
+	$(STRIP) $@
+
+# A musl program that traces a child via ptrace (TRACEME/GETREGSET/PEEK/CONT).
+$(BUILD_DIR)/ptracetest.elf: userprog/ptracetest.c | $(BUILD_DIR)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -o $@ $<
+	$(STRIP) $@
+
+# A musl program that exercises PTRACE_SYSCALL syscall-stops.
+$(BUILD_DIR)/ptsyscalltest.elf: userprog/ptsyscalltest.c | $(BUILD_DIR)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -o $@ $<
+	$(STRIP) $@
+
+# A musl program that exercises tmpfs edge cases (rename cycle + huge truncate).
+$(BUILD_DIR)/tmpfsedge.elf: userprog/tmpfsedge.c | $(BUILD_DIR)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -o $@ $<
+	$(STRIP) $@
+
+# A musl program that exercises the mmap length-overflow guard.
+$(BUILD_DIR)/mmapedge.elf: userprog/mmapedge.c | $(BUILD_DIR)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -o $@ $<
+	$(STRIP) $@
+
+# A musl program that verifies ptrace PSTATE sanitization blocks EL1 escalation.
+$(BUILD_DIR)/ptracesec.elf: userprog/ptracesec.c | $(BUILD_DIR)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -o $@ $<
+	$(STRIP) $@
+
+# A musl program that verifies a dying tracer's stopped tracee is resumed.
+$(BUILD_DIR)/ptraceorphan.elf: userprog/ptraceorphan.c | $(BUILD_DIR)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -o $@ $<
+	$(STRIP) $@
+
 # A musl program that fork()s and waitpid()s (exercises clone + wait4).
 $(BUILD_DIR)/forktest.elf: userprog/forktest.c | $(BUILD_DIR)
 	$(ZIG) cc -target aarch64-linux-musl -dynamic -Os -o $@ $<

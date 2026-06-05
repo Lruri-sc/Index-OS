@@ -136,6 +136,14 @@ void apply_mmu_regs(uint64_t mair, uint64_t tcr, uint64_t ttbr) {
     sctlr |= (1ULL << 0);   // M
     sctlr |= (1ULL << 2);   // C
     sctlr |= (1ULL << 12);  // I
+    // EL0-enable bits Linux sets so userspace can read cache geometry + do its
+    // own cache maintenance without trapping to EL1 (EC 0x18). The OpenJDK JVM
+    // reads CTR_EL0 (cache line sizes) during CPU feature detection and uses
+    // dc cvau / ic ivau to flush its JIT code cache; without these it took a
+    // trapped-MSR EL0 fault and died.
+    sctlr |= (1ULL << 14);  // DZE  -- EL0 `dc zva`
+    sctlr |= (1ULL << 15);  // UCT  -- EL0 read of CTR_EL0
+    sctlr |= (1ULL << 26);  // UCI  -- EL0 dc cvau/civac/cvac + ic ivau
     asm volatile("msr sctlr_el1, %0" ::"r"(sctlr));
     asm volatile("isb");
 }

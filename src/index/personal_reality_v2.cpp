@@ -1,8 +1,11 @@
 #include "index/personal_reality_v2.hpp"
 
+#include "arch/aarch64/cpu.hpp"  // arch::this_cpu_id for the re-entrant Pr2Guard
+#include "index/anti_skill.hpp"  // serialize page-table mutation across cores (Pr2Guard)
 #include "index/artificial_heaven.hpp"
 #include "index/esper.hpp"
 #include "index/imaginary_number_district.hpp"
+#include "index/lateran.hpp"
 #include "index/teleport.hpp"
 #include "index/tree_diagram.hpp"
 
@@ -159,6 +162,20 @@ uint64_t page_attrs(uint8_t prot) {
 uint64_t *ensure_l3_entry(uint64_t l1_pa, uint64_t va) {
     uint64_t *l1 = table_at(l1_pa);
     uint64_t &l1e = l1[l1_index(va)];
+    // SECURITY: refuse to descend into a table still SHARED with the kernel's
+    // master L1 (the inherited kernel mappings -- e.g. the kernel's own GiB at
+    // L1[1], a kTable -> kernel g_l2/g_l3). Otherwise a user fault in that VA
+    // range walks into the kernel's shared leaf tables and pr2_handle_fault
+    // rewrites a kernel PTE to an EL0-accessible page -> the faulting process
+    // gains RW to kernel memory across every address space (a mmap MAP_FIXED at
+    // 0x40000000 then a touch is enough). RAM-block entries (L1[2..], kBlock) are
+    // privatized by the break-before-make below and never alias the kernel's
+    // tables, so only the shared kTable is dangerous. Mainstream kernels keep
+    // user mappings strictly in the user half; here we reject any VA whose
+    // top-level entry is still the kernel's shared table -> the access SIGSEGVs.
+    if ((l1e & 0b11ULL) == kTable && l1e == teleport_kernel_l1()[l1_index(va)]) {
+        return nullptr;
+    }
     uint64_t l2_pa;
     if ((l1e & 0b11ULL) == kTable) {
         l2_pa = l1e & 0x0000FFFFFFFFF000ULL;
@@ -217,9 +234,16 @@ uint64_t *ensure_l3_entry(uint64_t l1_pa, uint64_t va) {
     return &l3[l3_index(va)];
 }
 
+// Find the VMA covering `va` in e's (shared) address space. The list lives in
+// e->mm (the PersonalReality jointly owned by all threads), so every thread
+// sees the same map. nullptr mm = Index legacy-pool Esper -> no VMA list.
 const Vma *find_vma(const Esper *e, uint64_t va) {
-    for (uint32_t i = 0; i < e->vma_count; ++i) {
-        const Vma &v = e->vmas[i];
+    if (e == nullptr || e->mm == nullptr) {
+        return nullptr;
+    }
+    const PersonalReality *mm = e->mm;
+    for (uint32_t i = 0; i < mm->vma_count; ++i) {
+        const Vma &v = mm->vmas[i];
         if (v.kind != VmaKind::Free && va >= v.start && va < v.end) {
             return &v;
         }
@@ -227,12 +251,133 @@ const Vma *find_vma(const Esper *e, uint64_t va) {
     return nullptr;
 }
 
+// Page-table serialization. pr2_handle_fault / ensure_l3_entry / pr2_write_user
+// / pr2_fork / pr2_destroy / pr2_mprotect read-modify-write an Esper's page
+// tables (L1/L2/L3 descriptors, CoW page copies) and VMA list with no lock.
+// Two cores touching the SAME address space then race: e.g. concurrent
+// ensure_l3_entry on one empty L1 entry both alloc an L2 and one store wins, so
+// the loser's L2/L3 subtree (and every mapping under it) leaks and that user VA
+// resolves to a stale / wrong page -- the residual SMP "broad wild-write"
+// (a user VA mapped to a kernel page or junk; the process then rets/derefs into
+// a kernel address -> EL0 fault). Mainstream kernels serialize this (Linux's
+// mmap_lock + the split page-table locks); Index uses one lock around every
+// page-table-mutating entry. Same-address-space concurrency arises from threads
+// (CLONE_VM share one ttbr0) and from a fault on one core while another core
+// writes that process's memory (deliver_pending_status / wait4 reap ->
+// pr2_write_user, which walks the *target's* page table).
+//
+// Same idiom + safety argument as Lateran's FsGuard: re-entrant on one CPU
+// (g_pt_owner) so pr2_write_user -> pr2_handle_fault and pr2_fork ->
+// pr2_create_addr_space don't self-deadlock; deliberately NOT irqsave because
+// esper_preempt never preempts EL1 (a fault/syscall holding this lock cannot be
+// switched out mid-section) and no IRQ handler touches page tables, so there is
+// no same-core re-entrant or self-deadlock path. The lock only ever nests
+// TreeDiagram's allocator lock and never takes g_esper_lock, so the global
+// order g_esper_lock -> g_pt_lock -> tree_diagram lock has no cycle.
+AntiSkill g_pt_lock;
+volatile int32_t g_pt_owner = -1; // CPU currently mutating page tables, -1 = none
+
+struct Pr2Guard {
+    bool owns;
+    Pr2Guard() {
+        const int32_t cpu = static_cast<int32_t>(arch::this_cpu_id());
+        if (g_pt_owner == cpu) { // already inside on this CPU -> re-entrant
+            owns = false;
+            return;
+        }
+        anti_skill_lock(g_pt_lock);
+        g_pt_owner = cpu;
+        owns = true;
+    }
+    ~Pr2Guard() {
+        if (!owns) return;
+        g_pt_owner = -1;
+        anti_skill_unlock(g_pt_lock);
+    }
+    Pr2Guard(const Pr2Guard &) = delete;
+    Pr2Guard &operator=(const Pr2Guard &) = delete;
+};
+
 } // namespace
 
+// ---- PersonalReality (address space / mm) pool + refcount -----------------
+// The Index analogue of Linux mm_struct allocation. 2*kMaxEspers slots cover
+// the transient fork/exec window where a process briefly references two address
+// spaces. Each slot is ~28 KiB (Vma[512]); the pool is a line-scanned table
+// guarded by g_esper_lock, exactly like usermode.cpp's g_as_refs. fork/exec are
+// rare so the linear scan + lock latency is negligible.
+namespace {
+constexpr uint32_t kMaxRealities = 2 * kMaxEspers;
+PersonalReality g_realities[kMaxRealities];
+} // namespace
+
+PersonalReality *reality_alloc() {
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    for (auto &r : g_realities) {
+        if (!r.in_use) {
+            // Reset only the metadata -- NOT `r = PersonalReality{}`, which would
+            // materialize a ~78 KiB stack temporary (Vma vmas[512] incl. file_path)
+            // and overflow the 64 KiB kernel stack (boot hung in init's first
+            // reality_alloc once file_path grew the struct). vmas[] need not be
+            // cleared: vma_count gates every read (find_vma loops i<vma_count) and
+            // pr2_add_vma fully rewrites each slot (incl. file_path) before use.
+            r.ttbr0 = 0;
+            r.vma_count = 0;
+            r.brk_start = 0;
+            r.brk_cur = 0;
+            r.mmap_next = 0;
+            r.in_use = true;
+            r.refs = 1;
+            anti_skill_unlock_irqrestore(g_esper_lock, flags);
+            return &r;
+        }
+    }
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
+    return nullptr; // pool exhausted
+}
+
+void reality_ref(PersonalReality *mm) {
+    if (mm == nullptr) return;
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    ++mm->refs;
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
+}
+
+void reality_unref(Esper *e) {
+    if (e == nullptr || e->mm == nullptr) return;
+    PersonalReality *mm = e->mm;
+    e->mm = nullptr; // drop e's reference regardless of who frees the space
+    bool destroy = false;
+    {
+        const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+        if (mm->refs > 0 && --mm->refs == 0) destroy = true;
+        anti_skill_unlock_irqrestore(g_esper_lock, flags);
+    }
+    if (!destroy) return;
+    // Last sharer: this CPU's TTBR0 may still point at mm->ttbr0. Switch to the
+    // kernel table BEFORE freeing the page tables (mirror Linux switching to
+    // init_mm before mmdrop) so a kernel fetch through TTBR0 can't hit a page
+    // we just returned to the allocator -- the SMP use-after-free guard that
+    // as_unref used to provide.
+    asm volatile("msr ttbr0_el1, %0" ::"r"(teleport_kernel_ttbr0()) : "memory");
+    asm volatile("dsb ish; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+    pr2_destroy(mm); // frees page tables + leaf pages; sets mm->ttbr0 = 0
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    mm->in_use = false;
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
+}
+
+uint32_t reality_active_count() {
+    uint32_t n = 0;
+    for (auto &r : g_realities) if (r.in_use) ++n;
+    return n;
+}
+
 bool pr2_create_addr_space(Esper *e) {
-    if (e == nullptr) {
+    if (e == nullptr || e->mm == nullptr) {
         return false;
     }
+    Pr2Guard _g;
     const uint64_t l1_pa = alloc_page_zeroed();
     if (l1_pa == 0) {
         return false;
@@ -252,36 +397,36 @@ bool pr2_create_addr_space(Esper *e) {
     // in pr2_handle_fault for the typical low-VA layout (entry 0 = 0..1 GiB,
     // covers 0x10000 / 0x400000 / etc).
     l1[0] = 0;
-    e->ttbr0 = l1_pa;
-    e->vma_count = 0;
-    imaginary_number_district::write("[pr2] create pid=");
-    imaginary_number_district::dec(e->pid);
-    imaginary_number_district::write(" ttbr0="); imaginary_number_district::hex(l1_pa);
-    imaginary_number_district::writeln("");
+    e->mm->ttbr0 = l1_pa; // authoritative page-table base
+    e->ttbr0 = l1_pa;     // fast-path cache for the context switch (mirror)
+    e->mm->vma_count = 0;
     return true;
 }
 
 bool pr2_add_vma(Esper *e, uint64_t start, uint64_t end, uint8_t prot,
                  uint8_t kind, const uint8_t *file_src, uint64_t file_off,
-                 uint64_t file_size, uint64_t seg_vaddr) {
-    if (e == nullptr || end <= start) {
+                 uint64_t file_size, uint64_t seg_vaddr,
+                 const char *file_path) {
+    if (e == nullptr || e->mm == nullptr || end <= start) {
         return false;
     }
+    PersonalReality *mm = e->mm; // VMAs live in the shared address space
+    Pr2Guard _g; // the VMA list is read by find_vma during concurrent faults
     // Reuse a Free slot left behind by pr2_remove_vma_range. Without this the
     // table fills monotonically: busybox shell's malloc rounds large allocs
     // to mmap+munmap, and every command leaks ~1 slot. kMaxVmas=32 was hit
     // around 20-25 commands -> mmap returned -ENOMEM -> "sh: out of memory".
     uint32_t slot = kMaxVmas;
-    for (uint32_t i = 0; i < e->vma_count; ++i) {
-        if (e->vmas[i].kind == VmaKind::Free) { slot = i; break; }
+    for (uint32_t i = 0; i < mm->vma_count; ++i) {
+        if (mm->vmas[i].kind == VmaKind::Free) { slot = i; break; }
     }
     if (slot == kMaxVmas) {
-        if (e->vma_count >= kMaxVmas) {
+        if (mm->vma_count >= kMaxVmas) {
             return false;
         }
-        slot = e->vma_count++;
+        slot = mm->vma_count++;
     }
-    Vma &v = e->vmas[slot];
+    Vma &v = mm->vmas[slot];
     v.start = start & ~kPageMask;                                  // page-align down
     v.end = (end + kPageMask) & ~kPageMask;                        // and up
     v.prot = prot;
@@ -290,6 +435,16 @@ bool pr2_add_vma(Esper *e, uint64_t start, uint64_t end, uint8_t prot,
     v.file_off = file_off;
     v.file_size = file_size;
     v.seg_pad = (seg_vaddr != 0 && seg_vaddr >= v.start) ? (seg_vaddr - v.start) : 0;
+    // Demand-paging source path (for file_src==nullptr file mmaps). Copied so it
+    // outlives the fd, which a program may close right after mmap. Slot reuse
+    // requires always (re)setting it -- clear it when no path is given.
+    if (file_path != nullptr) {
+        uint32_t i = 0;
+        for (; i + 1 < sizeof(v.file_path) && file_path[i] != '\0'; ++i) v.file_path[i] = file_path[i];
+        v.file_path[i] = '\0';
+    } else {
+        v.file_path[0] = '\0';
+    }
     return true;
 }
 
@@ -312,6 +467,7 @@ bool pr2_write_user(Esper *e, uint64_t va, const void *src, uint64_t n) {
     if (e == nullptr) {
         return false;
     }
+    Pr2Guard _g; // hold across the whole multi-byte/multi-page write
     const auto *s = static_cast<const uint8_t *>(src);
     for (uint64_t i = 0; i < n; ++i) {
         uint8_t *dst = user_byte_ptr(e, va + i);
@@ -319,6 +475,26 @@ bool pr2_write_user(Esper *e, uint64_t va, const void *src, uint64_t n) {
             return false;
         }
         *dst = s[i];
+    }
+    return true;
+}
+
+// Read n bytes from `e`'s user address space (va) into kernel `dst`. The mirror
+// of pr2_write_user, used by ptrace PEEK to read a tracee's memory from the
+// tracer's syscall context (user_byte_ptr faults the page in via e's own page
+// table). Returns false if any byte's VA is unmapped/unfaultable.
+bool pr2_read_user(Esper *e, uint64_t va, void *dst, uint64_t n) {
+    if (e == nullptr) {
+        return false;
+    }
+    Pr2Guard _g;
+    auto *d = static_cast<uint8_t *>(dst);
+    for (uint64_t i = 0; i < n; ++i) {
+        const uint8_t *src = user_byte_ptr(e, va + i);
+        if (src == nullptr) {
+            return false;
+        }
+        d[i] = *src;
     }
     return true;
 }
@@ -337,58 +513,76 @@ static uint64_t lookup_l3(uint64_t l1_pa, uint64_t va) {
 }
 
 bool pr2_fork(Esper *parent, Esper *child) {
-    if (parent == nullptr || child == nullptr) {
+    if (parent == nullptr || child == nullptr || parent->mm == nullptr) {
         return false;
     }
-    if (!pr2_create_addr_space(child)) {
-        return false;
+    // A fork gets a brand-new, independent address space (its own
+    // PersonalReality). reality_alloc takes g_esper_lock, so call it OUTSIDE the
+    // page-table Pr2Guard to keep the global lock order (g_esper_lock first,
+    // then g_pt_lock).
+    child->mm = reality_alloc();
+    if (child->mm == nullptr) {
+        return false; // address-space pool exhausted
     }
-    // Copy the VMA list verbatim (file_src pointers are shared read-only ELF
-    // image bytes; the caller refcounts those images).
-    child->vma_count = parent->vma_count;
-    for (uint32_t i = 0; i < parent->vma_count; ++i) {
-        child->vmas[i] = parent->vmas[i];
-    }
-    // Copy-on-write: share every currently-mapped page between parent and child
-    // read-only, bumping its refcount. The first write in either address space
-    // takes a permission fault that pr2_handle_fault resolves by copying the
-    // page privately. Far cheaper than the old eager whole-copy, and unmapped
-    // pages still fault in independently on first touch.
-    for (uint32_t i = 0; i < parent->vma_count; ++i) {
-        Vma &pv = parent->vmas[i];
-        if (pv.kind == VmaKind::Free) continue;
-        for (uint64_t va = pv.start; va < pv.end; va += kPageSize) {
-            uint64_t *pe = ensure_l3_entry(parent->ttbr0, va);
-            if (pe == nullptr || (*pe & 0b11ULL) != kPage) {
-                continue; // not mapped in parent -> child faults it in later
+    PersonalReality *pm = parent->mm;
+    PersonalReality *cm = child->mm;
+    bool ok = false;
+    {
+        Pr2Guard _g; // pr2_create_addr_space below re-enters the guard (no-op)
+        if (pr2_create_addr_space(child)) {
+            // Copy the VMA list verbatim (file_src pointers are shared read-only
+            // ELF image bytes; the caller refcounts those images). brk/mmap
+            // bookkeeping is part of the address space, so copy it too.
+            cm->vma_count = pm->vma_count;
+            for (uint32_t i = 0; i < pm->vma_count; ++i) {
+                cm->vmas[i] = pm->vmas[i];
             }
-            const uint64_t ppa = *pe & 0x0000FFFFFFFFF000ULL;
-            // Downgrade the parent's mapping to read-only so its next write also
-            // copy-on-writes (preserve the page's exec/UXN bits and PA).
-            const uint64_t attrs_ro = page_attrs(static_cast<uint8_t>(pv.prot & ~kVmaProtW));
-            *pe = ppa | kPage | attrs_ro;
-            // Map the same physical page read-only in the child and share it.
-            uint64_t *ce = ensure_l3_entry(child->ttbr0, va);
-            if (ce == nullptr) return false;
-            *ce = ppa | kPage | attrs_ro;
-            page_ref(ppa); // now mapped in two address spaces
-            // Flush the parent's stale (writable) TLB entry.
-            asm volatile("tlbi vaae1is, %0" ::"r"(va >> 12));
+            cm->brk_start = pm->brk_start;
+            cm->brk_cur = pm->brk_cur;
+            cm->mmap_next = pm->mmap_next;
+            // Copy-on-write: share every currently-mapped page between parent and
+            // child read-only, bumping its refcount. The first write in either
+            // address space takes a permission fault that pr2_handle_fault
+            // resolves by copying the page privately. Far cheaper than an eager
+            // whole-copy; unmapped pages still fault in independently later.
+            ok = true;
+            for (uint32_t i = 0; i < pm->vma_count && ok; ++i) {
+                Vma &pv = pm->vmas[i];
+                if (pv.kind == VmaKind::Free) continue;
+                for (uint64_t va = pv.start; va < pv.end; va += kPageSize) {
+                    uint64_t *pe = ensure_l3_entry(parent->ttbr0, va);
+                    if (pe == nullptr || (*pe & 0b11ULL) != kPage) {
+                        continue; // not mapped in parent -> child faults it in later
+                    }
+                    const uint64_t ppa = *pe & 0x0000FFFFFFFFF000ULL;
+                    // Downgrade the parent's mapping to read-only so its next
+                    // write also copy-on-writes (preserve exec/UXN bits + PA).
+                    const uint64_t attrs_ro = page_attrs(static_cast<uint8_t>(pv.prot & ~kVmaProtW));
+                    *pe = ppa | kPage | attrs_ro;
+                    // Map the same physical page read-only in the child + share.
+                    uint64_t *ce = ensure_l3_entry(child->ttbr0, va);
+                    if (ce == nullptr) { ok = false; break; }
+                    *ce = ppa | kPage | attrs_ro;
+                    page_ref(ppa); // now mapped in two address spaces
+                    asm volatile("tlbi vaae1is, %0" ::"r"(va >> 12)); // flush parent's stale RW TLB
+                }
+            }
+            asm volatile("dsb ish; isb" ::: "memory");
         }
     }
-    asm volatile("dsb ish; isb" ::: "memory");
+    if (!ok) {
+        reality_unref(child); // release the half-built space (outside Pr2Guard)
+        return false;
+    }
     return true;
 }
 
-void pr2_destroy(Esper *e) {
-    if (e == nullptr || e->ttbr0 == 0) {
+void pr2_destroy(PersonalReality *mm) {
+    if (mm == nullptr || mm->ttbr0 == 0) {
         return;
     }
-    const uint64_t l1_pa = e->ttbr0;
-    imaginary_number_district::write("[pr2] destroy pid=");
-    imaginary_number_district::dec(e->pid);
-    imaginary_number_district::write(" ttbr0="); imaginary_number_district::hex(l1_pa);
-    imaginary_number_district::writeln("");
+    Pr2Guard _g;
+    const uint64_t l1_pa = mm->ttbr0;
     uint64_t *l1 = table_at(l1_pa);
     const uint64_t *kl1 = teleport_kernel_l1();
     constexpr uint64_t kAddrMask = 0x0000FFFFFFFFF000ULL;
@@ -417,7 +611,7 @@ void pr2_destroy(Esper *e) {
         tree_diagram_free_page(l2_pa); // per-process L2 table page
     }
     tree_diagram_free_page(l1_pa); // the L1 table page itself
-    e->ttbr0 = 0;
+    mm->ttbr0 = 0;
 }
 
 // Punch a hole [lo, hi) out of the address space: truncate or invalidate any
@@ -430,13 +624,15 @@ void pr2_destroy(Esper *e) {
 // need a free VMA slot we may not have, and ld-musl doesn't generate that
 // pattern.
 void pr2_remove_vma_range(Esper *e, uint64_t lo, uint64_t hi) {
-    if (e == nullptr || hi <= lo) {
+    if (e == nullptr || e->mm == nullptr || hi <= lo) {
         return;
     }
+    PersonalReality *mm = e->mm; // munmap operates on the shared address space
+    Pr2Guard _g;
     lo &= ~kPageMask;
     hi = (hi + kPageMask) & ~kPageMask;
-    for (uint32_t i = 0; i < e->vma_count; ++i) {
-        Vma &v = e->vmas[i];
+    for (uint32_t i = 0; i < mm->vma_count; ++i) {
+        Vma &v = mm->vmas[i];
         if (v.kind == VmaKind::Free || v.end <= lo || v.start >= hi) {
             continue;
         }
@@ -485,18 +681,63 @@ void pr2_remove_vma_range(Esper *e, uint64_t lo, uint64_t hi) {
 }
 
 void pr2_mprotect(Esper *e, uint64_t va, uint64_t len, uint8_t prot) {
-    if (e == nullptr || len == 0) {
+    if (e == nullptr || e->mm == nullptr || len == 0) {
         return;
     }
+    PersonalReality *mm = e->mm; // mprotect the shared address space (all threads see it)
+    Pr2Guard _g;
     const uint64_t lo = va & ~kPageMask;
     const uint64_t hi = (va + len + kPageMask) & ~kPageMask;
-    // Update the protection of any VMA that overlaps the range (musl mprotects
-    // whole regions, so a wholesale update matches the common case).
-    for (uint32_t i = 0; i < e->vma_count; ++i) {
-        Vma &v = e->vmas[i];
-        if (v.kind != VmaKind::Free && v.start < hi && v.end > lo) {
-            v.prot = prot;
+    // Apply the new prot to EXACTLY [lo, hi). A VMA that straddles a boundary is
+    // SPLIT so the parts outside the range keep their old prot. The old code did
+    // a wholesale `v.prot = prot` on any overlapping VMA -- but GNU_RELRO
+    // mprotects just the FRONT of the data segment to RO, which then turned the
+    // segment's .bss read-only too. A later write to .bss faulted, pr2_handle_
+    // fault re-applied the RO VMA prot and returned "handled", the eret re-ran
+    // the store, it faulted again... a silent 100%-CPU permission-fault spin
+    // (this is exactly what hung the OpenJDK JVM at thread startup). Splitting
+    // matches Linux mprotect, which operates on page ranges, not whole regions.
+    const uint32_t n = mm->vma_count;
+    for (uint32_t i = 0; i < n; ++i) {
+        const Vma orig = mm->vmas[i];
+        if (orig.kind == VmaKind::Free || orig.start >= hi || orig.end <= lo) {
+            continue;
         }
+        if (orig.start >= lo && orig.end <= hi) {
+            mm->vmas[i].prot = prot; // fully inside the range -- just change prot
+            continue;
+        }
+        // Straddles a boundary: drop it, re-add up to 3 sub-ranges. For a
+        // file-backed VMA each sub-range keeps the same file_src; a sub-range
+        // that starts past the file-data origin rebases file_off so demand
+        // faults still copy the right bytes (the fault handler reads
+        // file_src[file_off + (va - seg_va)]).
+        const uint64_t seg_va = orig.start + orig.seg_pad;
+        const uint64_t seg_end = seg_va + orig.file_size;
+        mm->vmas[i].kind = VmaKind::Free; // remove original (frees the slot for re-add)
+        auto readd = [&](uint64_t s, uint64_t en, uint8_t pr) {
+            if (en <= s) return;
+            if (orig.kind == VmaKind::File && (orig.file_src != nullptr || orig.file_path[0] != '\0')) {
+                uint64_t nsv, noff, nsz;
+                const uint64_t fe = (seg_end < en) ? seg_end : en; // file-data end in [s,en)
+                if (s <= seg_va) { nsv = seg_va; noff = orig.file_off;
+                                   nsz = (fe > nsv) ? (fe - nsv) : 0; }
+                else { nsv = s; noff = orig.file_off + (s - seg_va);
+                       nsz = (fe > s) ? (fe - s) : 0; }
+                // Preserve demand-paging: a split file VMA keeps file_src (resident
+                // buffer = ELF) OR file_path (demand mmap) -- pass whichever it uses.
+                pr2_add_vma(e, s, en, pr, static_cast<uint8_t>(VmaKind::File),
+                            orig.file_src, noff, nsz, nsv,
+                            orig.file_src != nullptr ? nullptr : orig.file_path);
+            } else {
+                pr2_add_vma(e, s, en, pr, static_cast<uint8_t>(orig.kind),
+                            nullptr, 0, 0, 0);
+            }
+        };
+        if (orig.start < lo) readd(orig.start, lo, orig.prot);                 // before: old prot
+        readd(orig.start > lo ? orig.start : lo,
+              orig.end < hi ? orig.end : hi, prot);                            // in-range: new prot
+        if (orig.end > hi) readd(hi, orig.end, orig.prot);                     // after: old prot
     }
     // Rewrite already-mapped pages in range with the new permission bits.
     for (uint64_t p = lo; p < hi; p += kPageSize) {
@@ -518,7 +759,11 @@ void pr2_mprotect(Esper *e, uint64_t va, uint64_t len, uint8_t prot) {
 }
 
 uint64_t pr2_user_phys(Esper *e, uint64_t va) {
-    if (e == nullptr || !pr2_handle_fault(e, va)) {
+    if (e == nullptr) {
+        return 0;
+    }
+    Pr2Guard _g; // span fault-in + walk so the L3 entry can't change between them
+    if (!pr2_handle_fault(e, va)) {
         return 0;
     }
     const uint64_t pe = lookup_l3(e->ttbr0, va & ~kPageMask);
@@ -528,10 +773,24 @@ uint64_t pr2_user_phys(Esper *e, uint64_t va) {
     return (pe & 0x0000FFFFFFFFF000ULL) | (va & kPageMask);
 }
 
+bool pr2_range_free(const Esper *e, uint64_t lo, uint64_t hi) {
+    if (e == nullptr || e->mm == nullptr || hi <= lo) {
+        return false;
+    }
+    const PersonalReality *mm = e->mm;
+    for (uint32_t i = 0; i < mm->vma_count; ++i) {
+        const Vma &v = mm->vmas[i];
+        if (v.kind == VmaKind::Free) continue;
+        if (lo < v.end && v.start < hi) return false; // overlaps a live VMA
+    }
+    return true;
+}
+
 bool pr2_prefault_range(Esper *e, uint64_t va, uint64_t len) {
     if (e == nullptr || len == 0) {
         return true;
     }
+    Pr2Guard _g;
     const uint64_t first = va & ~kPageMask;
     const uint64_t last = (va + len - 1) & ~kPageMask;
     for (uint64_t page = first; page <= last; page += kPageSize) {
@@ -548,14 +807,10 @@ bool pr2_handle_fault(Esper *e, uint64_t far) {
     if (e == nullptr) {
         return false;
     }
+    Pr2Guard _g;
     const uint64_t page_va = far & ~kPageMask;
     const Vma *v = find_vma(e, page_va);
     if (v == nullptr) {
-        imaginary_number_district::write("[pr2 dbg] NO VMA covers far=");
-        imaginary_number_district::hex(far);
-        imaginary_number_district::write(" vma_count=");
-        imaginary_number_district::dec(e->vma_count);
-        imaginary_number_district::writeln("");
         return false;
     }
     // Make sure the L1/L2/L3 chain exists, then check the L3 entry: if it's
@@ -607,7 +862,7 @@ bool pr2_handle_fault(Esper *e, uint64_t far) {
     // with this 4 KiB page and memcpy just that slice; everything else in the
     // page stays zero (the .bss tail and any pre-segment padding from
     // page-aligning v->start down).
-    if (v->kind == VmaKind::File && v->file_src != nullptr) {
+    if (v->kind == VmaKind::File && (v->file_src != nullptr || v->file_path[0] != '\0')) {
         const uint64_t seg_va = v->start + v->seg_pad;
         const uint64_t seg_end = seg_va + v->file_size;
         const uint64_t pg_lo = page_va;
@@ -619,9 +874,15 @@ bool pr2_handle_fault(Esper *e, uint64_t far) {
             const uint64_t src_off = v->file_off + (lo - seg_va);
             const uint64_t copy = hi - lo;
             auto *dst = reinterpret_cast<uint8_t *>(teleport_high_alias(page_pa));
-            const uint8_t *src = v->file_src + src_off;
-            for (uint64_t i = 0; i < copy; ++i) {
-                dst[dst_off + i] = src[i];
+            if (v->file_src != nullptr) {
+                const uint8_t *src = v->file_src + src_off; // resident buffer (ELF segments)
+                for (uint64_t i = 0; i < copy; ++i) dst[dst_off + i] = src[i];
+            } else {
+                // Demand-paged file mmap: read this page's slice straight from the
+                // filesystem (no whole-file kernel buffer). Bytes not read stay
+                // zero from alloc_page_zeroed (.bss tail / short read at EOF).
+                lateran_pread(v->file_path, src_off,
+                              reinterpret_cast<char *>(dst + dst_off), static_cast<uint32_t>(copy));
             }
         }
         // Executable page just written via the data side: make it coherent for
@@ -667,6 +928,43 @@ void pr2_dump_walk(uint64_t l1_pa, uint64_t va) {
     const uint64_t l3e = table_at(l3_pa)[l3_index(va)];
     d::write(" | L3["); d::dec(l3_index(va)); d::write("]="); d::hex(l3e);
     d::writeln("");
+}
+
+// [JVMDIAG] dump ALL of e's VMAs (capped) -- to see if a thread's VMA list is
+// missing a region another thread mapped (CLONE_VM copies the list, shares the
+// page tables -> divergence).
+void pr2_dump_all_vmas(Esper *e) {
+    namespace d = imaginary_number_district;
+    if (e == nullptr || e->mm == nullptr) { d::writeln("[pr2 vmas] (no mm)"); return; }
+    const PersonalReality *mm = e->mm; // the shared address-space map
+    d::write("[pr2 vmas] count="); d::dec(mm->vma_count);
+    d::write(" is_thread="); d::dec(static_cast<uint64_t>(e->is_thread ? 1 : 0));
+    d::writeln("");
+    uint32_t shown = 0;
+    for (uint32_t i = 0; i < mm->vma_count && shown < 40; ++i) {
+        const Vma &v = mm->vmas[i];
+        if (v.kind == VmaKind::Free) continue;
+        ++shown;
+        d::write("  ["); d::hex(v.start); d::write(","); d::hex(v.end);
+        d::write(") p="); d::dec(static_cast<uint64_t>(v.prot));
+        d::write(" k="); d::dec(static_cast<uint64_t>(v.kind)); d::writeln("");
+    }
+}
+
+// [JVMDIAG] dump the VMA covering `va` (prot/kind/range) -- to see whether a
+// faulting write hit a VMA that is read-only by design or wrongly mapped.
+void pr2_dump_vma(Esper *e, uint64_t va) {
+    namespace d = imaginary_number_district;
+    const Vma *v = find_vma(e, va & ~kPageMask);
+    if (v == nullptr) { d::write("[pr2 vma] none for "); d::hex(va); d::writeln(""); return; }
+    d::write("[pr2 vma] va="); d::hex(va);
+    d::write(" start="); d::hex(v->start); d::write(" end="); d::hex(v->end);
+    d::write(" prot="); d::dec(static_cast<uint64_t>(v->prot));
+    d::write("(R"); d::dec((v->prot & kVmaProtR) ? 1 : 0);
+    d::write("W"); d::dec((v->prot & kVmaProtW) ? 1 : 0);
+    d::write("X"); d::dec((v->prot & kVmaProtX) ? 1 : 0); d::write(")");
+    d::write(" kind="); d::dec(static_cast<uint64_t>(v->kind));
+    d::write(" filesz="); d::hex(v->file_size); d::writeln("");
 }
 
 } // namespace index

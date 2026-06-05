@@ -37,6 +37,15 @@ enter_user:                 // x0 = user entry, x1 = user stack top, x2 = ttbr0
     mov     x10, sp
     str     x10, [x9, #96]
 
+    // [ELRGUARD] Refuse to eret into a non-EL0 entry/SP (a corrupt fresh-exec
+    // context). Same invariant + divert (.Lresume_corrupt) as resume_user_eret.
+    // x0=entry (-> EL0 PC), x1=user SP; x9 is free after the kctx save above.
+    movz    x9, #0x80, lsl #32       // 0x80_0000_0000 = 39-bit EL0 VA ceiling
+    cmp     x0, x9                    // entry
+    bhs     .Lresume_corrupt
+    cmp     x1, x9                    // user SP
+    bhs     .Lresume_corrupt
+
     msr     ttbr0_el1, x2   // install this process's private address space
     dsb     ish
     tlbi    vmalle1is       // broadcast: a thread can migrate to another CPU
@@ -106,6 +115,27 @@ resume_user_eret:                 // x0=regs, x1=sp_el0, x2=elr, x3=spsr, x4=tpi
     mov     x10, sp
     str     x10, [x9, #96]
 
+    // [ELRGUARD-asm] Refuse to eret into a non-EL0 PC/SP. x2 (elr -> EL0 PC) and
+    // x1 (sp_el0) are the EXACT values about to be installed; validating them
+    // here closes the SMP window between run_one_esper's C-side ELRGUARD and
+    // this resume, where a concurrent wild-write can still smash the saved
+    // e->elr to a kernel high-half address (the value passed in x2 was reloaded
+    // from e->elr at the call site, AFTER the C check). eret'ing there runs
+    // kernel text at EL0 (UXN) -> instruction abort at a kernel PC -- the
+    // residual TCG crash. On corruption, divert before touching any EL0 sysreg.
+    movz    x9, #0x80, lsl #32       // 0x80_0000_0000 = 39-bit EL0 VA ceiling
+    cmp     x2, x9                    // elr (-> EL0 PC) must be a user VA
+    bhs     .Lresume_corrupt
+    cmp     x1, x9                    // sp_el0 must be a user VA
+    bhs     .Lresume_corrupt
+    // x0 = e->regs, a KERNEL (high-half) pointer. The residual SMP corruption
+    // sometimes delivers a user-range garbage here (observed x0=0x100000007),
+    // so the first restore load `ldr x1,[x0,#8]` below takes an EL1 data abort
+    // (ESR 0x96000005) that halts a secondary core. A valid regs ptr is always
+    // >= the ceiling (high half); a user-range value is corruption -> divert.
+    cmp     x0, x9                    // regs ptr must be a kernel addr (>= ceiling)
+    blo     .Lresume_corrupt
+
     msr     sp_el0, x1
     msr     elr_el1, x2
     msr     spsr_el1, x3
@@ -132,6 +162,24 @@ resume_user_eret:                 // x0=regs, x1=sp_el0, x2=elr, x3=spsr, x4=tpi
 
     isb
     eret
+
+.Lresume_corrupt:
+    // Corrupt EL0 context caught by [ELRGUARD-asm] above. We branched here
+    // before installing any EL0 sysreg and never eret, so EL0 state is
+    // untouched. Reinstate the kernel page table FIRST -- the boot core fetches
+    // kernel code through TTBR0, so the Esper's (possibly corrupt) table must
+    // not stay live; same rationale as leave_user. Then fault this CPU's Esper
+    // and unwind via leave_user back into run_espers, which re-picks a clean
+    // Esper. The g_user_kctx slot was saved by the preamble above, so leave_user
+    // returns into run_one_esper's caller exactly as a normal user exit would.
+    bl      kernel_ttbr0_phys
+    msr     ttbr0_el1, x0
+    dsb     ish
+    tlbi    vmalle1is
+    dsb     ish
+    isb
+    bl      resume_user_elr_corrupt
+    b       leave_user
 
 // FP/SIMD (NEON) save/restore. The kernel is built -mgeneral-regs-only, so the
 // integrated assembler defaults to +nofp+nosimd and would reject q-register

@@ -45,6 +45,10 @@ uint32_t lateran_list(LateranEntry *out, uint32_t max);
 // Returns bytes read, or -1 if not found / not mounted.
 int64_t lateran_read_file(const char *name, char *buf, uint32_t cap);
 
+// Demand-paging read: `len` bytes at byte `offset` (file-backed mmap faults a
+// page at a time instead of reading the whole file). -1 on unsupported backend.
+int64_t lateran_pread(const char *name, uint64_t offset, char *buf, uint32_t len);
+
 // --- write support (#7) ---------------------------------------------------
 
 // Create or overwrite root-directory file `name` with `len` bytes from `buf`
@@ -104,5 +108,12 @@ bool lateran_link(const char *target, const char *link_path);
 
 // Set atime/mtime on `path`. -1 means "do not change that field".
 bool lateran_utime(const char *path, int64_t atime, int64_t mtime);
+
+// Mount / unmount an in-memory tmpfs at `point` (absolute path, e.g. "/tmp").
+// Thin FsGuard-held wrappers over Testament so mount(2)/boot share the same
+// serialization as every other VFS op. testament_mount creates a fresh empty
+// tree; paths under `point` then route to the RAM-backed tmpfs.
+bool lateran_tmpfs_mount(const char *point);
+bool lateran_tmpfs_umount(const char *point);
 
 } // namespace index

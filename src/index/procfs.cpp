@@ -6,6 +6,7 @@
 #include "index/imaginary_number_district.hpp"
 #include "index/last_order.hpp"
 #include "index/misaka_network.hpp"
+#include "index/testament.hpp" // real tmpfs mount list for /proc/mounts
 #include "index/tree_diagram.hpp"
 #include "index/usermode.hpp"
 
@@ -167,8 +168,7 @@ uint32_t gen_mounts(char *buf, uint32_t cap) {
     uint32_t o = 0;
     o = append(buf, cap, o, "/dev/vda1 / ext2 rw,relatime 0 1\n");
     o = append(buf, cap, o, "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
-    o = append(buf, cap, o, "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n");
-    o = append(buf, cap, o, "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
+    o = tmpfs_proc_mounts(buf, cap, o); // real tmpfs mounts (Testament): /tmp, /dev/shm, ...
     o = append(buf, cap, o, "devpts /dev/pts devpts rw,nosuid,noexec,relatime 0 0\n");
     if (drivers::stiyl_magnus_status().present) {
         o = append(buf, cap, o, "hostshare /host 9p rw,trans=virtio,version=9p2000.L 0 0\n");
@@ -234,9 +234,10 @@ uint32_t gen_pid_status(Esper *me, char *buf, uint32_t cap) {
 
 uint32_t gen_pid_maps(Esper *me, char *buf, uint32_t cap) {
     uint32_t o = 0;
-    if (me == nullptr) return 0;
-    for (uint32_t i = 0; i < me->vma_count && o < cap; ++i) {
-        const Vma &v = me->vmas[i];
+    if (me == nullptr || me->mm == nullptr) return 0;
+    const PersonalReality *mm = me->mm;
+    for (uint32_t i = 0; i < mm->vma_count && o < cap; ++i) {
+        const Vma &v = mm->vmas[i];
         if (v.kind == VmaKind::Free) continue;
         o = append_hex64(buf, cap, o, v.start);
         if (o < cap) buf[o++] = '-';
@@ -327,18 +328,28 @@ uint32_t gen_pid_stat(Esper *me, char *buf, uint32_t cap) {
     // field 23 vsize (bytes), 24 rss (pages)
     uint64_t vsize = 0;
     uint64_t rss_pages = 0;
-    for (uint32_t i = 0; i < me->vma_count; ++i) {
-        const Vma &v = me->vmas[i];
-        if (v.kind == VmaKind::Free) continue;
-        vsize += (v.end - v.start);
-        rss_pages += (v.end - v.start) / 4096; // overestimate (counts unmapped)
+    if (me->mm != nullptr) {
+        for (uint32_t i = 0; i < me->mm->vma_count; ++i) {
+            const Vma &v = me->mm->vmas[i];
+            if (v.kind == VmaKind::Free) continue;
+            vsize += (v.end - v.start);
+            rss_pages += (v.end - v.start) / 4096; // overestimate (counts unmapped)
+        }
     }
     if (o < cap) buf[o++] = ' ';
     o = append_u64(buf, cap, o, vsize);
     if (o < cap) buf[o++] = ' ';
     o = append_u64(buf, cap, o, rss_pages);
-    // fields 25..52: pad with zeros so positional parsers don't trip.
-    for (int i = 0; i < 28; ++i) o = append(buf, cap, o, " 0");
+    // fields 25 rsslim, 26 startcode, 27 endcode: zero.
+    o = append(buf, cap, o, " 0 0 0");
+    // field 28 startstack: HotSpot's os::Linux::capture_initial_stack() reads
+    // this to locate the primordial (main) thread stack base. Give it the
+    // initial SP region top -- without it HotSpot warns "Can't detect primordial
+    // thread stack location" and can't set up stack-overflow guard pages.
+    if (o < cap) buf[o++] = ' ';
+    o = append_u64(buf, cap, o, me->stack_top);
+    // fields 29..52 (24 fields): zero-pad so positional parsers don't trip.
+    for (int i = 0; i < 24; ++i) o = append(buf, cap, o, " 0");
     if (o < cap) buf[o++] = '\n';
     return o;
 }
@@ -354,6 +365,7 @@ uint32_t gen_self_maps(char *buf, uint32_t cap)   { return gen_pid_maps(self_esp
 uint32_t gen_self_cmdline(char *buf, uint32_t cap) { return gen_pid_cmdline(self_esper(), buf, cap); }
 uint32_t gen_self_exe(char *buf, uint32_t cap)    { return gen_pid_exe(self_esper(), buf, cap); }
 uint32_t gen_self_cwd(char *buf, uint32_t cap)    { return gen_pid_cwd(self_esper(), buf, cap); }
+uint32_t gen_self_stat(char *buf, uint32_t cap)   { return gen_pid_stat(self_esper(), buf, cap); }
 
 // ---- dispatch ----
 
@@ -376,6 +388,7 @@ const Entry kEntries[] = {
     {"/proc/mounts",     false, gen_mounts},
     {"/proc/self",       true,  nullptr},
     {"/proc/self/status", false, gen_self_status},
+    {"/proc/self/stat",  false, gen_self_stat},   // HotSpot reads this for the primordial stack
     {"/proc/self/maps",  false, gen_self_maps},
     {"/proc/self/cmdline", false, gen_self_cmdline},
     {"/proc/self/exe",   false, gen_self_exe},

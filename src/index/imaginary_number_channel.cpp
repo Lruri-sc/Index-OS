@@ -341,11 +341,26 @@ int64_t inc_recvfrom(int idx, uint8_t *buf, uint32_t cap,
     return static_cast<int64_t>(n);
 }
 
+// Atomic CAS dec-if-positive (refcount_t style); returns the new value. refs is
+// cross-core RMW'd: fork inherits the AF_UNIX fd and bumps refs on the forking
+// core (linux clone fd-copy) while a concurrent close drops it on another, and
+// SCM_RIGHTS passing refs/transfers across cores. A plain --/++ is a torn RMW:
+// a lost decrement leaks the channel slot; a lost increment frees it early while
+// a peer still holds it (UAF). Linux keeps file->f_count atomic for this.
+static uint16_t chan_ref_dec(uint16_t &v) {
+    uint16_t cur = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    while (cur > 0) {
+        if (__atomic_compare_exchange_n(&v, &cur, static_cast<uint16_t>(cur - 1),
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return static_cast<uint16_t>(cur - 1);
+    }
+    return 0;
+}
+
 void inc_close(int idx) {
     if (!valid(idx)) return;
     INChannel &c = g_channels[idx];
-    if (c.refs > 0) --c.refs;
-    if (c.refs > 0) return;
+    if (chan_ref_dec(c.refs) > 0) return;
     // Last reference: notify the peer (if stream) and free the slot.
     if (c.kind == ChannelKind::Stream && c.peer_idx >= 0 && valid(c.peer_idx)) {
         INChannel &peer = g_channels[c.peer_idx];
@@ -360,7 +375,7 @@ void inc_close(int idx) {
 }
 
 void inc_inc_ref(int idx) {
-    if (valid(idx)) ++g_channels[idx].refs;
+    if (valid(idx)) __atomic_add_fetch(&g_channels[idx].refs, 1, __ATOMIC_ACQ_REL);
 }
 
 bool inc_socketpair(int out[2]) {

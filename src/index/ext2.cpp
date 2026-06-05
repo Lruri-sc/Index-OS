@@ -41,6 +41,19 @@ alignas(16) uint8_t g_ind[kMaxBlock];   // single-indirect block scratch
 alignas(16) uint8_t g_ind2[kMaxBlock];  // double-indirect mid scratch
 alignas(16) uint8_t g_inode[256];       // one inode
 
+// [BLKCACHE] Direct-mapped buffer cache. ext2 had no block cache, so every
+// read_block hit the virtio-blk spin-poll (underline_read) -- class loading and
+// repeated inode/indirect/dir-block reads re-fetched the same blocks thousands
+// of times. A 2 MB direct-mapped cache turns the repeats into a memcpy. Write-
+// through (write_block updates the line) keeps it coherent with the disk. Safe
+// under the FsGuard that serializes all Lateran/ext2 access -- the same single-
+// threading the g_blk/g_ind scratch buffers above already rely on.
+constexpr uint32_t kBlkCacheN = 512; // 512 lines * 4 KB = 2 MB
+struct BlkCacheLine { uint32_t block; bool valid; };
+BlkCacheLine g_bc_meta[kBlkCacheN];
+alignas(16) uint8_t g_bc_data[kBlkCacheN][kMaxBlock];
+void bc_copy(uint8_t *d, const uint8_t *s, uint32_t n) { for (uint32_t i = 0; i < n; ++i) d[i] = s[i]; }
+
 // Current wall-clock seconds for inode timestamps. ext2 stores i_atime/i_ctime/
 // i_mtime as u32 seconds since the Unix epoch at offsets 8/12/16.
 uint32_t now_epoch_u32() {
@@ -58,12 +71,21 @@ const drivers::Underline &disk() { return drivers::underline_status(); }
 
 // Read a whole filesystem block into `dst`.
 bool read_block(uint32_t block, uint8_t *dst) {
-    const uint32_t spb = g_sb.block_size / kSector;
+    const uint32_t bs = g_sb.block_size;
+    const uint32_t idx = block % kBlkCacheN;
+    if (g_bc_meta[idx].valid && g_bc_meta[idx].block == block) {
+        bc_copy(dst, g_bc_data[idx], bs); // hit: skip the virtio-blk spin-poll
+        return true;
+    }
+    const uint32_t spb = bs / kSector;
     for (uint32_t s = 0; s < spb; ++s) {
         if (!drivers::underline_read(disk(), static_cast<uint64_t>(block) * spb + s, dst + s * kSector)) {
             return false;
         }
     }
+    bc_copy(g_bc_data[idx], dst, bs); // fill the line
+    g_bc_meta[idx].block = block;
+    g_bc_meta[idx].valid = true;
     return true;
 }
 
@@ -74,6 +96,10 @@ bool write_block(uint32_t block, const uint8_t *src) {
             return false;
         }
     }
+    const uint32_t idx = block % kBlkCacheN; // write-through: keep the line coherent
+    bc_copy(g_bc_data[idx], src, g_sb.block_size);
+    g_bc_meta[idx].block = block;
+    g_bc_meta[idx].valid = true;
     return true;
 }
 
@@ -172,6 +198,16 @@ uint32_t dir_lookup(const char *name) {
             const uint16_t rec = rd16(&g_blk[off + 4]);
             const uint8_t nlen = g_blk[off + 6];
             if (rec == 0) break;
+            // Validate the dirent against the block bound before reading its
+            // name: a corrupt/malicious ext2 image can set name_len so that
+            // off+8+nlen runs past the block scratch g_blk -> over-read of
+            // adjacent kernel memory. Mirrors Linux ext2_check_dir_entry
+            // (name_len + 8 <= rec_len, entry within the block). Skip the whole
+            // block on a malformed entry rather than trusting it.
+            if (static_cast<uint32_t>(off) + 8u + nlen > bs ||
+                rec < 8u + nlen) {
+                break;
+            }
             if (e_ino != 0) {
                 bool eq = true;
                 for (uint32_t i = 0; i < nlen && eq; ++i) {
@@ -298,6 +334,40 @@ int64_t ext2_read_file(const char *path, char *buf, uint32_t cap) {
         } else {
             if (!read_block(pb, g_blk)) break;
             for (uint32_t i = 0; i < n; ++i) buf[done + i] = static_cast<char>(g_blk[i]);
+        }
+        done += n;
+    }
+    return static_cast<int64_t>(done);
+}
+
+// Like ext2_read_file but reads `len` bytes starting at byte `offset` -- the
+// demand-paging primitive (file-backed mmap faults one page at a time instead
+// of slurping the whole file into the kernel heap). Seeks to offset/block_size,
+// honors the in-block offset, never crosses a block boundary per iteration, and
+// clamps to the file size. Returns bytes read (0 at/past EOF), -1 on error.
+int64_t ext2_pread(const char *path, uint64_t offset, char *buf, uint32_t len) {
+    if (!g_sb.mounted) return -1;
+    const uint32_t ino = resolve(path);
+    if (ino == 0) return -1;
+    if (inode_is_dir()) return -1; // not a regular file
+    const uint32_t size = inode_size();
+    if (offset >= size) return 0; // at or past EOF
+    const uint64_t avail = size - offset;
+    uint32_t want = (len < avail) ? len : static_cast<uint32_t>(avail);
+    const uint32_t bs = g_sb.block_size;
+    uint32_t done = 0;
+    while (done < want) {
+        const uint64_t cur = offset + done;
+        const uint32_t lbn = static_cast<uint32_t>(cur / bs);
+        const uint32_t boff = static_cast<uint32_t>(cur % bs); // byte offset within the block
+        const uint32_t pb = map_block(lbn);
+        uint32_t n = want - done;
+        if (n > bs - boff) n = bs - boff; // stay within this block per iteration
+        if (pb == 0) {
+            for (uint32_t i = 0; i < n; ++i) buf[done + i] = 0; // sparse hole
+        } else {
+            if (!read_block(pb, g_blk)) break;
+            for (uint32_t i = 0; i < n; ++i) buf[done + i] = static_cast<char>(g_blk[boff + i]);
         }
         done += n;
     }

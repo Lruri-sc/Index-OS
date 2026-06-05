@@ -84,6 +84,23 @@ constexpr uint32_t kEsrEcShift = 26;
 constexpr uint32_t kEcSvc64 = 0x15;
 constexpr uint32_t kEcInstrAbortLowerEl = 0x20;
 constexpr uint32_t kEcDataAbortLowerEl = 0x24;
+constexpr uint32_t kEcSoftStepLowerEl = 0x32; // ptrace single-step debug exception
+
+// ptrace "Mental Out" single-step: arm/disarm hardware software-step (MDSCR_EL1
+// .SS, bit 0) for the EL0 context about to be resumed. Read-modify-write so the
+// other MDSCR debug bits are preserved. SPSR.SS (PSTATE single-step) is bit 21;
+// set in the resumed SPSR alongside this so exactly one EL0 instruction retires
+// before the Software Step exception (EC 0x32) re-traps. Called from every
+// resume-to-EL0 path (load_ctx, esper_preempt) keyed on the resuming Esper's
+// flag, so a preempt to a non-stepping Esper can never leave stepping armed.
+constexpr uint64_t kSpsrSsBit = 1ULL << 21;
+inline void mental_out_arm_step(bool on) {
+    uint64_t mdscr;
+    asm volatile("mrs %0, mdscr_el1" : "=r"(mdscr));
+    if (on) mdscr |= 1ULL; else mdscr &= ~1ULL;
+    asm volatile("msr mdscr_el1, %0" ::"r"(mdscr));
+    asm volatile("isb");
+}
 
 constexpr uint64_t kSpsrEl0 = 0x340; // EL0t, IRQ enabled (preemptible), F/A/D masked
 
@@ -340,6 +357,26 @@ uint64_t read_file_fd(Esper *e, uint32_t fd, char *buf, uint64_t cap) {
     if (fd >= kMaxFds || e->fds[fd].kind != FdKind::file) {
         return static_cast<uint64_t>(-1);
     }
+    const uint64_t off = e->fds[fd].off;
+    // Fast path: ext2/tmpfs support POSITIONAL reads -- fetch only [off, off+cap),
+    // not the whole file. Critical for large files: java's rt.jar is 33.5 MiB and
+    // class loading issues thousands of small reads; the old "re-read the whole
+    // file every call" path (kept as the fallback below) re-fetched all 33.5 MiB
+    // (~65k virtio-blk blocks) on EVERY 202-byte read -- which looked exactly like
+    // a hang (CPU 0% in virtio-blk I/O wait, PC pinned in underline_read). The
+    // lldb backtrace at the "hang" was the smoking gun: linux_file_read(cap=202)
+    // -> read_named_file(cap=35126412). lateran_pread already existed (added for
+    // demand paging) but this SYS_read path never used it.
+    if (cap > 0) {
+        const uint32_t want = cap > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(cap);
+        const int64_t pn = lateran_pread(e->fds[fd].path, off, buf, want);
+        if (pn >= 0) { // ext2/tmpfs served it (0 = EOF)
+            e->fds[fd].off += static_cast<uint64_t>(pn);
+            return static_cast<uint64_t>(pn);
+        }
+    }
+    // Fallback for in-memory filesystems (Bookshelf / GrimoireFS) that don't do
+    // positional reads: re-read the whole (small) file and copy the slice.
     const int64_t fsz = linux_file_size(e->fds[fd].path);
     if (fsz < 0) return 0;
     const uint64_t need = static_cast<uint64_t>(fsz);
@@ -352,7 +389,6 @@ uint64_t read_file_fd(Esper *e, uint32_t fd, char *buf, uint64_t cap) {
         dark_matter_free(tmp);
         return 0;
     }
-    const uint64_t off = e->fds[fd].off;
     uint64_t n = 0;
     while (n < cap && off + n < static_cast<uint64_t>(total)) {
         buf[n] = tmp[off + n];
@@ -432,71 +468,13 @@ bool image_unref(uint8_t *img) {
     return true; // untracked (loaded before refcounting) -> free
 }
 
-// Refcount per address space (keyed by its L1 physical address = ttbr0). A
-// fork gets its own space (count 1); a clone(CLONE_VM) thread shares the
-// creator's (count++). The space's page tables + leaf pages are reclaimed
-// (pr2_destroy) only when the last sharer drops. Only pr2-created (Linux)
-// address spaces are tracked here -- Index legacy-pool ttbr0s never enter the
-// table, so as_unref on them is a safe no-op.
-struct AddrSpaceRef {
-    uint64_t ttbr0 = 0;
-    uint32_t refs = 0;
-};
-AddrSpaceRef g_as_refs[2 * kMaxEspers];
-
-// g_as_refs is a small line-scanned table; under SMP two concurrent
-// fork()s could both miss an existing entry mid-scan and double-insert.
-// Wrap mutations in g_esper_lock. The scan is bounded (32 entries) and
-// fork/exit are rare, so latency is negligible.
-void as_ref(uint64_t ttbr0) {
-    if (ttbr0 == 0) return;
-    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
-    for (auto &r : g_as_refs) {
-        if (r.ttbr0 == ttbr0) { ++r.refs; anti_skill_unlock_irqrestore(g_esper_lock, flags); return; }
-    }
-    for (auto &r : g_as_refs) {
-        if (r.ttbr0 == 0) { r.ttbr0 = ttbr0; r.refs = 1; anti_skill_unlock_irqrestore(g_esper_lock, flags); return; }
-    }
-    anti_skill_unlock_irqrestore(g_esper_lock, flags);
-}
-
-// Drop one reference on `e`'s address space; if it was the last, destroy it
-// (free all its pages back to TreeDiagram). No-op for untracked (Index) spaces.
-// pr2_destroy is called OUTSIDE the lock: refs==0 means no other sharer
-// exists, so the address space is dead and only this CPU touches it. Holding
-// the scheduler lock across the (large) page-table walk would needlessly
-// stall every other CPU.
-void as_unref(Esper *e) {
-    if (e == nullptr || e->ttbr0 == 0) return;
-    bool destroy = false;
-    {
-        const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
-        for (auto &r : g_as_refs) {
-            if (r.ttbr0 == e->ttbr0) {
-                if (--r.refs == 0) {
-                    r.ttbr0 = 0;
-                    destroy = true;
-                }
-                break;
-            }
-        }
-        anti_skill_unlock_irqrestore(g_esper_lock, flags);
-    }
-    if (destroy) {
-        // SMP use-after-free fix: secondary cores execute kernel code through
-        // the LOW/identity mapping (TTBR0), and THIS cpu's TTBR0 still points
-        // at `e`'s page tables here. pr2_destroy returns those pages to the
-        // allocator, where another core can reuse + overwrite them while we are
-        // still fetching kernel instructions through them on the way back to the
-        // idle loop -> wild branch (the intermittent cpu-N PC-alignment crash,
-        // ELR 0x80000345). Switch TTBR0 to the kernel table (it carries the full
-        // low identity map, so kernel VAs stay valid) BEFORE freeing -- mirrors
-        // Linux switching to init_mm before mmdrop().
-        asm volatile("msr ttbr0_el1, %0" ::"r"(teleport_kernel_ttbr0()) : "memory");
-        asm volatile("dsb ish; tlbi vmalle1is; dsb ish; isb" ::: "memory");
-        pr2_destroy(e); // frees page tables + leaf pages; sets ttbr0=0
-    }
-}
+// Address-space refcounting now lives in PersonalReality (personal_reality_v2):
+// reality_alloc / reality_ref / reality_unref replace the old as_ref/as_unref +
+// g_as_refs table. The refcount is PersonalReality::refs; the page tables are
+// reclaimed (pr2_destroy) when the last sharer drops, and reality_unref does the
+// same switch-to-kernel-TTBR0 SMP use-after-free guard as_unref used to (a
+// secondary core may still be fetching kernel code through this CPU's TTBR0 when
+// the space is freed -- mirror Linux switching to init_mm before mmdrop).
 
 // Translate an ELF p_flags (PF_R=4, PF_W=2, PF_X=1) into our Vma prot bits.
 uint8_t elf_prot_to_vma_prot(uint32_t pflags) {
@@ -517,12 +495,22 @@ uint8_t elf_prot_to_vma_prot(uint32_t pflags) {
 // highest mapped VA in *out_max_end and the program-header VA in *out_phdr_va.
 // Returns false if the VMA table fills up. `image` is the kernel buffer the
 // file-backed VMAs will read from on each fault (must stay resident).
-bool map_elf_loads(Esper *e, const uint8_t *image, uint64_t load_base,
-                   uint64_t *out_max_end, uint64_t *out_phdr_va) {
+bool map_elf_loads(Esper *e, const uint8_t *image, uint64_t image_len,
+                   uint64_t load_base, uint64_t *out_max_end, uint64_t *out_phdr_va) {
     namespace district = imaginary_number_district;
     const uint64_t e_phoff = rd64(image + 32);
     const uint16_t e_phentsize = rd16(image + 54);
     const uint16_t e_phnum = rd16(image + 56);
+    // The phdr table fields are attacker-controlled (any user can exec a crafted
+    // ELF). Validate the whole table lies within the image before walking it,
+    // else `ph = image + e_phoff + i*e_phentsize` reads kernel heap past the
+    // buffer. Mirrors Linux fs/binfmt_elf.c. (phnum*phentsize <= 2^32, no wrap.)
+    if (e_phentsize < 56 || e_phnum == 0 || e_phoff > image_len ||
+        static_cast<uint64_t>(e_phnum) * e_phentsize > image_len - e_phoff) {
+        district::writeln("exec: bad ELF phdr table.");
+        return false;
+    }
+    constexpr uint64_t kUserCeiling = 0x8000000000ULL;
     uint64_t max_end = 0;
     uint64_t phdr_va = 0;
     for (uint16_t i = 0; i < e_phnum; ++i) {
@@ -536,10 +524,26 @@ bool map_elf_loads(Esper *e, const uint8_t *image, uint64_t load_base,
         const uint64_t p_memsz = rd64(ph + 40);
         const uint32_t p_flags = rd32(ph + 4);
         const uint64_t va_start = load_base + p_vaddr;
+        // Reject a segment that escapes the user VA window (a crafted p_vaddr
+        // could otherwise place a VMA over the kernel's inherited mappings).
+        if (va_start >= kUserCeiling || p_memsz > kUserCeiling ||
+            va_start + p_memsz > kUserCeiling) {
+            district::writeln("exec: PT_LOAD outside user VA.");
+            return false;
+        }
+        // Clamp the file-backed extent to what actually lies in the image, so a
+        // crafted p_offset/p_filesz can't make the fault handler copy kernel heap
+        // past the image into the user's page (an info leak). The tail beyond
+        // eff_filesz is zero-filled (.bss) as usual.
+        uint64_t eff_filesz = 0;
+        if (p_offset < image_len) {
+            const uint64_t avail = image_len - p_offset;
+            eff_filesz = (p_filesz < avail) ? p_filesz : avail;
+        }
         const uint8_t prot = elf_prot_to_vma_prot(p_flags);
         if (!pr2_add_vma(e, va_start, va_start + p_memsz, prot,
                          static_cast<uint8_t>(VmaKind::File),
-                         image + p_offset, 0, p_filesz, va_start)) {
+                         image + p_offset, 0, eff_filesz, va_start)) {
             district::writeln("exec: too many VMAs / bad PT_LOAD.");
             return false;
         }
@@ -614,21 +618,29 @@ bool load_linux_elf_into_slot(Esper *e, uint8_t *file, int64_t len) {
         }
         e->linux_interp_image = nullptr;
     }
-    // Tear down a prior Linux address space on this slot (exec replacing a
-    // Linux program) so its pages are reclaimed. No-op for an Index legacy-pool
-    // ttbr0 (the Komoe-fork-then-exec case), which isn't tracked.
-    as_unref(e);
+    // Tear down a prior Linux address space on this slot (exec replacing a Linux
+    // program): reality_unref drops this Esper's reference and frees the space if
+    // it was the last sharer. No-op for an Index legacy-pool Esper (null mm; the
+    // Komoe-fork-then-exec case).
+    reality_unref(e);
 
-    if (!pr2_create_addr_space(e)) {
-        district::writeln("exec: pr2_create_addr_space failed.");
+    // A fresh, independent address space (PersonalReality) for the new program.
+    e->mm = reality_alloc();
+    if (e->mm == nullptr) {
+        district::writeln("exec: address-space pool exhausted.");
         return false;
     }
-    as_ref(e->ttbr0); // this process now owns its fresh address space
+    if (!pr2_create_addr_space(e)) {
+        district::writeln("exec: pr2_create_addr_space failed.");
+        reality_unref(e);
+        return false;
+    }
+    // (reality_alloc already set refs=1 -- this process owns its new space.)
 
     // Map the main program's PT_LOADs.
     uint64_t max_seg_end = 0;
     uint64_t phdr_va = 0;
-    if (!map_elf_loads(e, file, load_base, &max_seg_end, &phdr_va)) {
+    if (!map_elf_loads(e, file, static_cast<uint64_t>(len), load_base, &max_seg_end, &phdr_va)) {
         return false;
     }
 
@@ -669,7 +681,7 @@ bool load_linux_elf_into_slot(Esper *e, uint8_t *file, int64_t len) {
         }
         interp_base = kLinuxInterpBase;
         uint64_t interp_max = 0;
-        if (!map_elf_loads(e, ibuf, interp_base, &interp_max, nullptr)) {
+        if (!map_elf_loads(e, ibuf, static_cast<uint64_t>(ilen), interp_base, &interp_max, nullptr)) {
             dark_matter_free(ibuf);
             return false;
         }
@@ -696,9 +708,9 @@ bool load_linux_elf_into_slot(Esper *e, uint8_t *file, int64_t len) {
         district::writeln("exec: brk VMA failed.");
         return false;
     }
-    e->brk_start = brk_base;
-    e->brk_cur = brk_base;
-    e->mmap_next = kLinuxMmapBase;
+    e->mm->brk_start = brk_base;
+    e->mm->brk_cur = brk_base;
+    e->mm->mmap_next = kLinuxMmapBase;
 
     // Replace any prior image (a previous exec on this slot) and take
     // ownership of `file`. image_unref so a forked sibling sharing the old
@@ -748,6 +760,76 @@ bool load_linux_elf_into_slot(Esper *e, uint8_t *file, int64_t len) {
     return true;
 }
 
+// Resolve symlinks and normalize "."/".."/"//" in an absolute path so that
+// readlink("/proc/self/exe") returns the *canonical real* path. musl resolves
+// $ORIGIN in a RUNPATH from /proc/self/exe; OpenJDK's launcher is reached via
+// the /usr/bin/java -> ../lib/jvm/.../bin/java symlink, and its RUNPATH
+// ($ORIGIN/../lib/aarch64/jli) only finds libjli.so when $ORIGIN is the *real*
+// bin dir. Mirrors Linux, where /proc/self/exe always names the resolved file.
+static void canonicalize_exe_path(const char *name, char *out, uint32_t cap) {
+    if (out == nullptr || cap == 0) return;
+    out[0] = 0;
+    if (name == nullptr || name[0] == 0) return;
+
+    char cur[kCwdCap];
+    uint32_t cn = 0;
+    for (; name[cn] != 0 && cn + 1 < kCwdCap; ++cn) cur[cn] = name[cn];
+    cur[cn] = 0;
+
+    for (int iter = 0; iter < 16; ++iter) {
+        // --- normalize cur: collapse '.', '..', and repeated '/' ---
+        char norm[kCwdCap];
+        uint32_t nl = 0;
+        norm[nl++] = '/';
+        const char *s = cur;
+        while (*s == '/') ++s;
+        while (*s != 0) {
+            const char *comp = s;
+            uint32_t clen = 0;
+            while (s[clen] != 0 && s[clen] != '/') ++clen;
+            s += clen;
+            while (*s == '/') ++s;
+            if (clen == 1 && comp[0] == '.') continue;
+            if (clen == 2 && comp[0] == '.' && comp[1] == '.') {
+                while (nl > 1 && norm[nl - 1] != '/') --nl;
+                if (nl > 1) --nl; // drop the separating '/'
+                if (nl == 0) norm[nl++] = '/';
+                continue;
+            }
+            if (nl > 1 && nl + 1 < kCwdCap) norm[nl++] = '/';
+            for (uint32_t k = 0; k < clen && nl + 1 < kCwdCap; ++k) norm[nl++] = comp[k];
+        }
+        norm[nl] = 0;
+        for (uint32_t k = 0; k <= nl; ++k) cur[k] = norm[k];
+
+        // --- resolve one symlink level; stop when cur is not a symlink ---
+        char tgt[kCwdCap];
+        const int32_t n = lateran_readlink(cur, tgt, kCwdCap - 1);
+        if (n <= 0) break; // not a symlink (or error) -> cur is the real path
+        tgt[n] = 0;
+
+        if (tgt[0] == '/') {
+            uint32_t k = 0;
+            for (; tgt[k] != 0 && k + 1 < kCwdCap; ++k) cur[k] = tgt[k];
+            cur[k] = 0;
+        } else {
+            // relative target: dirname(cur) + '/' + tgt
+            uint32_t slash = 0;
+            for (uint32_t k = 0; cur[k] != 0; ++k) if (cur[k] == '/') slash = k;
+            char tmp[kCwdCap];
+            uint32_t tl = 0;
+            for (uint32_t k = 0; k <= slash && tl + 1 < kCwdCap; ++k) tmp[tl++] = cur[k];
+            for (uint32_t k = 0; tgt[k] != 0 && tl + 1 < kCwdCap; ++k) tmp[tl++] = tgt[k];
+            tmp[tl] = 0;
+            for (uint32_t k = 0; k <= tl; ++k) cur[k] = tmp[k];
+        }
+    }
+
+    uint32_t k = 0;
+    for (; cur[k] != 0 && k + 1 < cap; ++k) out[k] = cur[k];
+    out[k] = 0;
+}
+
 // Returns false on any failure -- the ELF is validated into a temp buffer before
 // the slot's address space is rebuilt, so a failed exec leaves the old image
 // intact. Sets entry/stack/ttbr0/code_pages and started=false (fresh start).
@@ -769,6 +851,14 @@ bool load_elf_into_slot(uint32_t slot, const char *name) {
         dark_matter_free(file);
         dark_matter_free(img);
         return false;
+    }
+    // Record the full image path so readlink("/proc/self/exe") works (the musl
+    // loader resolves $ORIGIN in a RUNPATH from it -- OpenJDK's launcher needs it).
+    if (e != nullptr) {
+        // Store the *canonical* image path (symlinks resolved + normalized), so
+        // readlink("/proc/self/exe") yields the real binary and musl's $ORIGIN
+        // resolves correctly even when invoked via a symlink like /usr/bin/java.
+        canonicalize_exe_path(name, e->exe_path, kCwdCap);
     }
     // Sniff which ABI the ELF wants *before* building anything else. Linux
     // Espers go through pr2 (VMA + demand-paging) so they can use arbitrary
@@ -800,7 +890,7 @@ bool load_elf_into_slot(uint32_t slot, const char *name) {
     uint64_t span = 0;
     const uint64_t e_entry = build_image(file, len, img, 32 * 1024, &span);
     bool ok = e_entry != 0 || span != 0;
-    PersonalReality pr;
+    PersonalRealityV1 pr;
     if (ok) {
         pr = personal_reality_build(slot, img, span);
         ok = pr.valid;
@@ -894,7 +984,11 @@ void deliver_pending_status(Esper *e) {
         // (a pointer -> the SMP EL0 crash: FAR=0x11 near-null deref / a kernel
         // address in the user's PC). pr2_write_user is what signal-frame delivery
         // already uses for exactly this reason.
-        if (e->wait_status_is_linux) {
+        if (e->wait_status_is_stop) {
+            // ptrace-stop / job-control stop: WSTOPPED -> (stopsig << 8) | 0x7f.
+            const int32_t st = static_cast<int32_t>(((e->pending_status & 0xff) << 8) | 0x7f);
+            pr2_write_user(e, e->wait_status_ptr, &st, sizeof(st));
+        } else if (e->wait_status_is_linux) {
             // Linux wait status: normal exit -> (code & 0xff) << 8, a 32-bit int.
             const int32_t st = static_cast<int32_t>((e->pending_status & 0xff) << 8);
             pr2_write_user(e, e->wait_status_ptr, &st, sizeof(st));
@@ -906,6 +1000,7 @@ void deliver_pending_status(Esper *e) {
     e->has_pending_status = false;
     e->wait_status_ptr = 0;
     e->wait_status_is_linux = false;
+    e->wait_status_is_stop = false;
 }
 
 // Forward decl so park_on_pipe can hand the CPU to the next Esper.
@@ -996,6 +1091,9 @@ void linux_ref_fd_backend(const Fd &f) {
     case FdKind::unix_sock:  inc_inc_ref(f.sock_idx); break;
     case FdKind::eventfd:    eventfd_inc_ref(f.sock_idx); break;
     case FdKind::epoll:      epoll_inc_ref(f.sock_idx); break;
+    case FdKind::timerfd:    timerfd_inc_ref(f.sock_idx); break;
+    case FdKind::signalfd:   signalfd_inc_ref(f.sock_idx); break;
+    case FdKind::inotify:    inotify_inc_ref(f.sock_idx); break;
     case FdKind::pty_master: sr_master_inc_ref(f.sock_idx); break;
     case FdKind::pty_slave:  sr_slave_inc_ref(f.sock_idx); break;
     default: break; // closed/console/file/dev* hold no shared backend
@@ -1016,6 +1114,9 @@ void linux_release_fd_backend(const Fd &f) {
     case FdKind::unix_sock:  inc_close(f.sock_idx); break;
     case FdKind::eventfd:    eventfd_close(f.sock_idx); break;
     case FdKind::epoll:      epoll_close(f.sock_idx); break;
+    case FdKind::timerfd:    timerfd_close(f.sock_idx); break;
+    case FdKind::signalfd:   signalfd_close(f.sock_idx); break;
+    case FdKind::inotify:    inotify_close(f.sock_idx); break;
     case FdKind::pty_master: sr_close_master(f.sock_idx); break;
     case FdKind::pty_slave:  sr_close_slave(f.sock_idx); break;
     default: break;
@@ -1140,11 +1241,29 @@ void linux_rt_sigsuspend(int idx, uint64_t *frame) {
     // immediately so the drain in esper_preempt (or a future call) sees the
     // pre-sigsuspend mask and a wake-up flag cleared.
     if ((me->sig_pending & ~new_mask) != 0) {
-        me->sig_mask = me->sigsuspend_saved_mask;
-        me->wait_sigsuspend = false;
+        // A signal is deliverable under the sigsuspend (new) mask. The awaited
+        // signal's HANDLER must RUN, then sigsuspend returns -EINTR. Critical:
+        // keep wait_sigsuspend TRUE and compute `deliverable` against new_mask --
+        // do NOT restore saved_mask first. linux_deliver_signal's
+        // waking_sigsuspend path restores saved_mask, SKIPS the mask check (so the
+        // awaited signal runs instead of being re-queued under the restored mask),
+        // and snapshots saved_mask into the sigframe for rt_sigreturn. The earlier
+        // version restored saved_mask + cleared wait_sigsuspend FIRST, so (a) the
+        // deliverable scan used saved_mask (SIGCHLD blocked -> nothing to deliver)
+        // and (b) delivery saw wait_sigsuspend=false and re-queued SIGCHLD under
+        // the blocked mask without running the handler -> ash's `wait`
+        // sigsuspend-loops forever (its SIGCHLD handler never sets got-sigchld, so
+        // it never reaps + returns). Also set the LIVE frame[0]=-EINTR (the fast
+        // path doesn't load_ctx, so the eret uses the live frame; setting only
+        // me->regs[0] left sigsuspend returning its mask_ptr arg instead).
+        const uint64_t deliverable = me->sig_pending & ~new_mask;
+        const int sig = __builtin_ctzll(deliverable) + 1;
         anti_skill_unlock_irqrestore(g_esper_lock, lock_flags);
-        // Frame's regs[0] = -EINTR; signal will be drained on next preempt
-        // (or via the sync return path below if a sig handler must run).
+        frame[0] = static_cast<uint64_t>(-4); // -EINTR (saved into the sigframe)
+        // wait_sigsuspend is still true -> deliver via the waking_sigsuspend path.
+        linux_deliver_signal(me, sig, frame); // runs handler, or SIG_DFL/IGN: just
+                                              // restores mask + clears the wait
+        me->sig_pending &= ~(1ULL << (sig - 1));
         return;
     }
 
@@ -1187,21 +1306,38 @@ bool linux_execve_replace(int idx, const char *path, const char *const *user_arg
     if (e == nullptr) return false;
     // Copy argv/envp strings into a kernel buffer because load_elf_into_slot
     // rebuilds the user address space (the user-side strings would disappear).
-    // 4 KiB is plenty for a shell command line.
-    constexpr uint64_t kStageSize = 4096;
+    // 32 KiB: the OpenJDK launcher carries a long LD_LIBRARY_PATH + classpath +
+    // many env vars across its self-re-exec; 4 KiB truncated them.
+    constexpr uint64_t kStageSize = 32768;
     char *stage = static_cast<char *>(dark_matter_alloc(kStageSize));
     if (stage == nullptr) return false;
     uint32_t pos = 0;
     auto stage_str = [&](const char *src, const char **dst) -> bool {
         if (src == nullptr) return false;
         char *start = stage + pos;
-        while (*src != 0 && pos + 1 < kStageSize) {
-            stage[pos++] = *src++;
+        uint64_t mapped = ~0ULL;
+        while (pos + 1 < kStageSize) {
+            const uint64_t a = reinterpret_cast<uint64_t>(src);
+            // A user string (< the 39-bit ceiling) is prefaulted one page at a
+            // time so a string running into an unmapped page fails cleanly rather
+            // than faulting the kernel at EL1 (#5 class, like resolve_at's
+            // copy_user_cstr). A kernel string (>= ceiling, always mapped) is read
+            // directly -- run_elf_argv passes kernel argv for internal launches.
+            if (a < 0x8000000000ULL) {
+                const uint64_t pg = a & ~uint64_t(0xFFF);
+                if (pg != mapped) {
+                    if (!pr2_prefault_range(e, pg, 1)) return false;
+                    mapped = pg;
+                }
+            }
+            const char c = *src++;
+            stage[pos++] = c;
+            if (c == 0) {
+                *dst = start;
+                return true;
+            }
         }
-        if (pos + 1 >= kStageSize) return false;
-        stage[pos++] = 0;
-        *dst = start;
-        return true;
+        return false; // string longer than the staging buffer
     };
     e->exec_argc = 0;
     e->exec_envc = 0;
@@ -1241,6 +1377,22 @@ bool linux_execve_replace(int idx, const char *path, const char *const *user_arg
             release_esper_fd(e, i);
         }
     }
+    // execve resets CAUGHT signal handlers to SIG_DFL (Linux semantics): the new
+    // image must NOT inherit the old program's handler addresses, which now point
+    // into the replaced image. This was the worker-shutdown fault: java -version's
+    // worker thread inherited sh's SIGCHLD handler 0x44a654 -- an address in sh's
+    // code that became java brk heap after exec -- and on signal delivery the
+    // kernel set ELR=that handler, so the worker took an instruction-abort blr'ing
+    // into non-exec brk (JVMRC=139). SIG_DFL(0)/SIG_IGN(1) are preserved; only
+    // caught handlers (>1) reset. (Mirrors Linux flush_signal_handlers on exec.)
+    for (int s = 0; s < 64; ++s) {
+        if (e->sig_handler[s] > 1) {
+            e->sig_handler[s] = 0; // -> SIG_DFL
+            e->sig_restorer[s] = 0;
+            e->sig_flags[s] = 0;
+            e->sig_act_mask[s] = 0;
+        }
+    }
     // CLONE_VFORK: the child has now replaced its address space (load_elf_into_
     // slot gave it a fresh ttbr0), so the parent can safely resume on the old
     // shared stack. Release the vfork-suspended parent (keyed by our pid).
@@ -1274,52 +1426,9 @@ int linux_file_open(Esper *e, const char *path) {
     return -1; // fd table full
 }
 
-uint8_t *linux_file_mmap_buf(Esper *e, uint32_t fd, uint64_t *out_size) {
-    if (e == nullptr || fd >= kMaxFds || e->fds[fd].kind != FdKind::file) {
-        return nullptr;
-    }
-    const char *path = e->fds[fd].path;
-    // Reuse an existing buffer if we've already mmapped this exact path. The
-    // dynamic linker maps every PT_LOAD of a .so separately, so we'd otherwise
-    // hold N copies of the same file in the kernel heap.
-    for (uint32_t i = 0; i < e->mmap_buf_count; ++i) {
-        if (e->mmap_bufs[i] == nullptr) continue;
-        const char *p = e->mmap_buf_paths[i];
-        uint32_t k = 0;
-        for (; k < sizeof(e->mmap_buf_paths[0]); ++k) {
-            if (p[k] != path[k]) break;
-            if (p[k] == 0) {
-                if (out_size != nullptr) *out_size = e->mmap_buf_sizes[i];
-                return e->mmap_bufs[i];
-            }
-        }
-    }
-    if (e->mmap_buf_count >= 8) {
-        return nullptr;
-    }
-    const int64_t fsz = linux_file_size(path);
-    if (fsz < 0) return nullptr;
-    // Round up to a page so the page-fault-driven copy never reads past the
-    // owning allocation -- but never below 4 KiB so empty files still get a
-    // touchable buffer.
-    uint64_t need = (static_cast<uint64_t>(fsz) + 0xFFFu) & ~uint64_t(0xFFFu);
-    if (need < 0x1000) need = 0x1000;
-    auto *buf = static_cast<uint8_t *>(dark_matter_alloc(need));
-    if (buf == nullptr) {
-        return nullptr;
-    }
-    const int64_t n = read_named_file(path, reinterpret_cast<char *>(buf), static_cast<uint32_t>(need));
-    if (n < 0) {
-        dark_matter_free(buf);
-        return nullptr;
-    }
-    const uint32_t slot = e->mmap_buf_count++;
-    e->mmap_bufs[slot] = buf;
-    e->mmap_buf_sizes[slot] = static_cast<uint64_t>(n);
-    copy_str(e->mmap_buf_paths[slot], path, sizeof(e->mmap_buf_paths[slot]));
-    if (out_size != nullptr) *out_size = static_cast<uint64_t>(n);
-    return buf;
-}
+// linux_file_mmap_buf removed: file-backed mmap is now demand-paged. The fault
+// handler reads each page from the filesystem via lateran_pread (see
+// pr2_handle_fault + mmap case 222) -- no whole-file kernel buffer, no 8-cap.
 
 int linux_file_open_ex(Esper *e, const char *path, bool create, bool trunc, bool writable) {
     if (e == nullptr) {
@@ -1464,9 +1573,7 @@ void linux_fd_close(Esper *e, uint32_t fd) {
 // them; they read the anon-namespace g_as_refs / g_image_refs tables which
 // are visible within this translation unit.
 uint32_t as_ref_active_count() {
-    uint32_t n = 0;
-    for (auto &r : g_as_refs) if (r.ttbr0 != 0) ++n;
-    return n;
+    return reality_active_count(); // address-space count now lives in the reality pool
 }
 uint32_t image_ref_active_count() {
     uint32_t n = 0;
@@ -1482,7 +1589,7 @@ void release_linux_image(Esper *e) {
     // is the last sharer (threads keep it alive for siblings). Safe to free the
     // live TTBR0 here: we're in a syscall with IRQs masked, the kernel runs on
     // TTBR1, and the caller switches TTBR0 (with a TLBI) before any user access.
-    as_unref(e);
+    reality_unref(e);
     if (e->linux_elf_image != nullptr) {
         if (image_unref(e->linux_elf_image)) {
             dark_matter_free(e->linux_elf_image);
@@ -1496,14 +1603,8 @@ void release_linux_image(Esper *e) {
         }
         e->linux_interp_image = nullptr;
     }
-    for (uint32_t i = 0; i < e->mmap_buf_count; ++i) {
-        if (e->mmap_bufs[i] != nullptr) {
-            dark_matter_free(e->mmap_bufs[i]);
-            e->mmap_bufs[i] = nullptr;
-        }
-    }
-    e->mmap_buf_count = 0;
-    e->vma_count = 0;
+    // (file-backed mmap is demand-paged now -- no per-Esper mmap buffers to free;
+    // the VMA list belongs to the now-unref'd PersonalReality `mm`.)
 }
 
 // Tear the running Esper down with the given exit code and hand the CPU to
@@ -1666,7 +1767,11 @@ void load_ctx(Esper *e, uint64_t *frame) {
         }
         asm volatile("msr sp_el0, %0" ::"r"(e->sp_el0));
         asm volatile("msr elr_el1, %0" ::"r"(e->elr));
-        asm volatile("msr spsr_el1, %0" ::"r"(e->spsr));
+        // ptrace single-step: arm MDSCR.SS + set PSTATE.SS in the resumed SPSR so
+        // exactly one EL0 instruction runs before the step exception re-traps.
+        const uint64_t spsr = e->ptrace_singlestep ? (e->spsr | kSpsrSsBit) : e->spsr;
+        asm volatile("msr spsr_el1, %0" ::"r"(spsr));
+        mental_out_arm_step(e->ptrace_singlestep);
     } else {
         for (uint32_t i = 0; i < 31; ++i) {
             frame[i] = 0;
@@ -1674,6 +1779,7 @@ void load_ctx(Esper *e, uint64_t *frame) {
         asm volatile("msr sp_el0, %0" ::"r"(e->stack_top));
         asm volatile("msr elr_el1, %0" ::"r"(e->entry));
         asm volatile("msr spsr_el1, %0" ::"r"(kSpsrEl0));
+        mental_out_arm_step(false);
         e->started = true;
     }
     // Restore e's NEON state (zeroed for a fresh Esper). The caller erets via
@@ -1780,8 +1886,12 @@ void esper_preempt(uint64_t *frame) {
             frame[i] = n->regs[i];
         }
         frame[kFrameElr] = n->elr;
-        frame[kFrameSpsr] = n->spsr;
+        // ptrace single-step: irq_entry erets from frame[kFrameSpsr], so set
+        // PSTATE.SS there (+ arm MDSCR) when resuming a stepping tracee. Keyed on
+        // n's flag so preempting to a non-stepping Esper always disarms stepping.
+        frame[kFrameSpsr] = n->ptrace_singlestep ? (n->spsr | kSpsrSsBit) : n->spsr;
         asm volatile("msr sp_el0, %0" ::"r"(n->sp_el0));
+        mental_out_arm_step(n->ptrace_singlestep);
     } else {
         for (uint32_t i = 0; i < 31; ++i) {
             frame[i] = 0;
@@ -1789,6 +1899,7 @@ void esper_preempt(uint64_t *frame) {
         frame[kFrameElr] = n->entry;
         frame[kFrameSpsr] = kSpsrEl0;
         asm volatile("msr sp_el0, %0" ::"r"(n->stack_top));
+        mental_out_arm_step(false);
         n->started = true;
     }
     // Load n's vectors so it resumes with its own NEON state. Safe to do now:
@@ -1803,6 +1914,44 @@ void esper_preempt(uint64_t *frame) {
 // Switches address space, then either enters fresh or resumes saved context.
 // Returns via leave_user when the Esper parks / exits. Used by run_espers
 // (boot core) and by el0_try_run_one (secondary cores in SMP EL0 mode).
+// Tear down an Esper whose saved EL0 context was found corrupt (PC or SP
+// outside the 39-bit EL0 VA range). The residual SMP wild-write occasionally
+// smashes a parked Esper's saved e->elr/e->sp_el0 to a kernel high-half
+// address; eret'ing there faults EL0 on a UXN kernel page. Releases the Esper's
+// resources and faults it WITHOUT picking a successor -- the scheduler loop
+// re-picks a clean Esper. Shared by run_one_esper's C-side guard and
+// resume_user_eret's asm-side guard (resume_user_elr_corrupt).
+static void kill_corrupt_esper(int next, const char *where) {
+    namespace district = imaginary_number_district;
+    Esper *e = (next >= 0) ? esper_at(static_cast<uint32_t>(next)) : nullptr;
+    district::write("\n[ELRGUARD");
+    district::write(where);
+    district::write("] corrupt resume ctx");
+    if (e != nullptr) {
+        district::write(" pid "); district::dec(e->pid);
+        district::write(" elr="); district::hex(e->elr);
+        district::write(" sp_el0="); district::hex(e->sp_el0);
+        district::write(" name "); district::write(e->name);
+    }
+    district::writeln(" -> esper killed (kernel survives)");
+    if (e != nullptr) {
+        release_esper_pipes(e);
+        release_linux_image(e);
+    }
+    esper_fault_current(next); // fault + free this CPU's slot; loop re-picks
+}
+
+// Asm-side ELRGUARD fallback, called from resume_user_eret right before `eret`
+// when the PC/SP about to be installed into EL0 is not a canonical EL0 VA. This
+// closes the SMP window between run_one_esper's C-side check (below) and the
+// actual resume: a concurrent wild-write can smash this Esper's saved e->elr to
+// a kernel address after the C check but before the value is reloaded for the
+// resume call. We fault THIS CPU's running Esper; the asm then unwinds via
+// leave_user back into the scheduler.
+extern "C" void resume_user_elr_corrupt() {
+    kill_corrupt_esper(esper_running_index(), "-asm");
+}
+
 void run_one_esper(int next) {
     namespace district = imaginary_number_district;
     Esper *e = esper_at(static_cast<uint32_t>(next));
@@ -1824,15 +1973,9 @@ void run_one_esper(int next) {
         // kill THIS Esper cleanly instead of wild-jumping; kernel + peers live.
         constexpr uint64_t kUserCeiling = 0x8000000000ULL; // 39-bit EL0 VA ceiling
         if (e->elr >= kUserCeiling || e->sp_el0 >= kUserCeiling) {
-            district::write("\n[ELRGUARD] corrupt resume ctx pid ");
-            district::dec(e->pid);
-            district::write(" elr="); district::hex(e->elr);
-            district::write(" sp_el0="); district::hex(e->sp_el0);
-            district::write(" name "); district::write(e->name);
-            district::writeln(" -> esper killed (kernel survives)");
-            release_esper_pipes(e);
-            release_linux_image(e);
-            esper_fault_current(next); // fault + free this CPU's slot; loop re-picks
+            // C-side catch. resume_user_eret's asm guard closes the remaining
+            // window between here and the actual eret (see kill_corrupt_esper).
+            kill_corrupt_esper(next, "");
             return;
         }
         switch_ttbr0(e->ttbr0);
@@ -1958,7 +2101,14 @@ void run_espers() {
                 if (k == Esper::IpcWaitKind::AntennaRecv ||
                     k == Esper::IpcWaitKind::AntennaAccept ||
                     k == Esper::IpcWaitKind::AntennaConnect ||
-                    k == Esper::IpcWaitKind::PollWait) {
+                    k == Esper::IpcWaitKind::PollWait ||
+                    k == Esper::IpcWaitKind::EpollWait) {
+                    // EpollWait MUST keep the core at 100 Hz: network_tick fires
+                    // linux_ipc_wake(EpollWait,-1) every tick to re-scan epoll sets
+                    // (a timerfd/eventfd in the set becomes ready with no producer
+                    // event). If we deep-idle 1 s here, that re-scan stops and an
+                    // epoll_wait without a timeout never wakes -- HVF SMP=1 java
+                    // (HotSpot uses epoll) froze at CPU 0%. Mirrors the PollWait case.
                     net_poll = true;
                 }
             }
@@ -2406,24 +2556,30 @@ void linux_clone(int idx, uint64_t *frame) {
         // Thread: share the parent's address space + images (no copy). The
         // images stay alive until the last sharer exits (refcounted), and the
         // shared address space is reclaimed only when the last thread exits.
-        c->ttbr0 = p->ttbr0;
-        c->vma_count = p->vma_count;
-        for (uint32_t i = 0; i < p->vma_count; ++i) c->vmas[i] = p->vmas[i];
+        // SHARE the parent's address space: one PersonalReality (same VMA list,
+        // same page tables). Because the VMA list lives in the shared mm, a
+        // region mmap'd by ANY thread is instantly visible to all siblings --
+        // this is the fix for the CLONE_VM "VMA divergence" (gap 9) that killed
+        // the multi-threaded JVM. The mm + images stay alive until the last
+        // sharer exits (all refcounted).
+        c->mm = p->mm;
+        reality_ref(c->mm);  // one more sharer of this address space
+        c->ttbr0 = p->ttbr0; // fast-path cache mirrors the shared mm->ttbr0
         c->linux_elf_image = p->linux_elf_image;
         c->linux_interp_image = p->linux_interp_image;
         c->linux_elf_image_size = p->linux_elf_image_size;
         image_ref(p->linux_elf_image);
         image_ref(p->linux_interp_image);
-        as_ref(c->ttbr0); // one more sharer of this address space
         c->is_thread = true;
     } else {
-        // fork: independent (copy-on-write) address space.
+        // fork: independent (copy-on-write) address space. pr2_fork reality_allocs
+        // the child its own PersonalReality (refs=1) and copies parent's VMAs +
+        // brk/mmap bookkeeping + CoW pages into it.
         if (!pr2_fork(p, c)) {
             c->state = EsperState::free;
             frame[0] = static_cast<uint64_t>(-12); // -ENOMEM
             return;
         }
-        as_ref(c->ttbr0); // the child owns its own fresh address space
         c->linux_elf_image = p->linux_elf_image;
         c->linux_interp_image = p->linux_interp_image;
         c->linux_elf_image_size = p->linux_elf_image_size;
@@ -2437,10 +2593,10 @@ void linux_clone(int idx, uint64_t *frame) {
     // child setting it on itself) can move it out before exec.
     c->pgrp = p->pgrp;
     c->sid = p->sid;
-    c->brk_start = p->brk_start;
-    c->brk_cur = p->brk_cur;
-    c->mmap_next = p->mmap_next;
+    // (brk/mmap_next live in the shared PersonalReality `mm`: fork copies them in
+    // pr2_fork; a CLONE_VM thread shares them automatically.)
     for (uint32_t i = 0; i < kCwdCap; ++i) c->cwd[i] = p->cwd[i]; // inherit cwd
+    for (uint32_t i = 0; i < kCwdCap; ++i) c->exe_path[i] = p->exe_path[i]; // same image until execve
     c->uid = p->uid; c->euid = p->euid; c->suid = p->suid;
     c->gid = p->gid; c->egid = p->egid; c->sgid = p->sgid;
     for (uint32_t i = 0; i < 64; ++i) {
@@ -2568,69 +2724,498 @@ void linux_wait4(int idx, uint64_t *frame) {
     const uint64_t status_ptr = frame[1];
     const uint64_t options = frame[2];
 
-    // Reap path: find an exited/faulted child and atomically transition it
-    // to free under g_esper_lock so a concurrent fortis931_kill / exit on
-    // another CPU can't re-reap the same child (state=free then esper_create
-    // would happily reuse the slot from another core).
+    // ptrace "Mental Out": report a ptrace-stopped tracee first (WSTOPPED status
+    // (stopsig<<8)|0x7f). The tracee stays parked on PtraceStop -- NOT freed --
+    // and the tracer resumes it later via PTRACE_CONT/SYSCALL/SINGLESTEP/DETACH.
     {
         const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
-        uint32_t cpid = 0;
-        int64_t code = 0;
-        int reaped = -1;
+        int found = -1; uint32_t spid = 0; int ssig = 0;
         for (uint32_t i = 0; i < kMaxEspers; ++i) {
-            Esper *cand = esper_at(i);
-            if (cand != nullptr && cand->parent == idx &&
-                (cand->state == EsperState::exited ||
-                 cand->state == EsperState::faulted)) {
-                cpid = cand->pid;
-                code = cand->exit_code;
-                cand->state = EsperState::free;
-                reaped = static_cast<int>(i);
+            Esper *c = esper_at(i);
+            if (c != nullptr && c->ptrace_tracer == idx && c->ptrace_report) {
+                c->ptrace_report = false; // consumed by this wait
+                spid = c->pid; ssig = c->ptrace_stop_sig; found = static_cast<int>(i);
                 break;
             }
         }
         anti_skill_unlock_irqrestore(g_esper_lock, flags);
-        if (reaped >= 0) {
+        if (found >= 0) {
             if (status_ptr != 0) {
-                // pr2_write_user (not a raw deref): it breaks CoW + faults the
-                // page in. A raw write to a status pointer sitting in a
-                // fork-shared CoW page hits the shared physical page without
-                // triggering the copy, smashing the child's view of that VA (the
-                // SMP EL0 corruption: FAR=0x11 near-null deref / kernel addr in
-                // the user PC). Same fix as deliver_pending_status.
-                const int32_t st = static_cast<int32_t>((code & 0xff) << 8);
+                const int32_t st = static_cast<int32_t>(((ssig & 0xff) << 8) | 0x7f);
                 pr2_write_user(p, status_ptr, &st, sizeof(st));
             }
-            frame[0] = cpid;
+            frame[0] = spid;
             return;
         }
     }
-    if (esper_child_count(idx) == 0) {
+
+    // Reap-or-park, all under ONE g_esper_lock critical section so a child's
+    // concurrent exit (maybe_wake_parent_locked takes the same lock) cannot slip
+    // into a gap between "scan finds no exited child" and "park". With one lock
+    // it either lands BEFORE the scan (we reap the zombie) or AFTER we park
+    // (parent_is_in_wait4_locked is true, so it wakes us). The old code split
+    // scan and park into two separate locked regions; a child exiting in that
+    // window left a zombie AND skipped the wake -> the waiter parked forever.
+    // That lost-wakeup hung `cmd & cmd & wait` (several children exiting in
+    // parallel). This now mirrors linux_futex's check-then-park, which holds one
+    // lock across the value check AND the queue insertion for the same reason.
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    // Find an exited/faulted child and atomically transition it to free so a
+    // concurrent kill/exit on another CPU can't re-reap the same slot.
+    uint32_t cpid = 0;
+    int64_t code = 0;
+    int reaped = -1;
+    for (uint32_t i = 0; i < kMaxEspers; ++i) {
+        Esper *cand = esper_at(i);
+        if (cand != nullptr && cand->parent == idx &&
+            (cand->state == EsperState::exited ||
+             cand->state == EsperState::faulted)) {
+            cpid = cand->pid;
+            code = cand->exit_code;
+            cand->state = EsperState::free;
+            reaped = static_cast<int>(i);
+            break;
+        }
+    }
+    if (reaped >= 0) {
+        // We just consumed one child's SIGCHLD by reaping it. If NO other
+        // exited/zombie child remains, clear the parent's pending SIGCHLD bit so
+        // a later blocking read (the shell's next prompt) isn't spuriously
+        // interrupted by a stale SIGCHLD whose child is already gone -- that
+        // stale signal hung the command *after* `cmd & wait`. Mirrors Linux,
+        // where SIGCHLD is recomputed from the actual set of zombies.
+        bool more_zombies = false;
+        for (uint32_t j = 0; j < kMaxEspers; ++j) {
+            Esper *o = esper_at(j);
+            if (o != nullptr && o->parent == idx &&
+                (o->state == EsperState::exited || o->state == EsperState::faulted)) {
+                more_zombies = true; break;
+            }
+        }
+        if (!more_zombies) p->sig_pending &= ~(1ULL << (17 - 1)); // clear SIGCHLD
+        anti_skill_unlock_irqrestore(g_esper_lock, flags);
+        if (status_ptr != 0) {
+            // pr2_write_user (not a raw deref): breaks CoW + faults the page in.
+            // A raw write to a status pointer in a fork-shared CoW page would hit
+            // the shared physical page without copying, smashing the child's view
+            // (the SMP EL0 corruption: FAR=0x11 / kernel addr in the user PC).
+            const int32_t st = static_cast<int32_t>((code & 0xff) << 8);
+            pr2_write_user(p, status_ptr, &st, sizeof(st));
+        }
+        frame[0] = cpid;
+        return;
+    }
+    // No exited child yet -- decide ECHILD / WNOHANG / park WITHOUT releasing the
+    // lock, so the scan above and the park below are one atomic step.
+    bool has_tracee = false;
+    for (uint32_t i = 0; i < kMaxEspers; ++i) {
+        Esper *c = esper_at(i);
+        if (c != nullptr && c->ptrace_tracer == idx && c->state != EsperState::free) {
+            has_tracee = true; break;
+        }
+    }
+    if (esper_child_count(idx) == 0 && !has_tracee) {
+        anti_skill_unlock_irqrestore(g_esper_lock, flags);
         frame[0] = static_cast<uint64_t>(-10); // -ECHILD
         return;
     }
     if (options & 1 /*WNOHANG*/) {
-        frame[0] = 0;
+        // WNOHANG stays strictly non-blocking: no exited child -> return 0 now.
+        // sshd's reaper polls waitpid(-1, WNOHANG) and must never block (blocking
+        // it cratered ssh_truth to OK=2/CRASH=8). ash's `cmd & wait` also reaches
+        // here with WNOHANG, gets 0, then sigsuspends for SIGCHLD -- and the real
+        // fix is in parent_is_in_wait4_locked: a child's exit now correctly takes
+        // ash's sigsuspend down the SIGCHLD path (not a mis-reap), so ash's handler
+        // runs and it reaps. While ash is parked in sigsuspend (a real WFI), the
+        // background sleeper is scheduled and runs to exit. So a plain non-blocking
+        // return 0 here is correct for both; no yield/preempt needed (an extra
+        // esper_preempt here only added TCG-SMP wild-jump races without helping).
+        anti_skill_unlock_irqrestore(g_esper_lock, flags);
+        frame[0] = 0; // non-blocking WNOHANG, no exited child -> 0
         return;
     }
-    // Block until a child exits. The exit path wakes us; pending_status holds
-    // the raw code, which deliver-on-resume encodes into the user's int*.
+    // Block until a child exits. maybe_wake_parent_locked sets regs[0]=pid +
+    // pending_status and flips us ready; deliver-on-resume encodes pending_status
+    // into the user's int*. esper_park_and_pick_locked runs under the lock we
+    // already hold (same idiom as linux_futex's FUTEX_WAIT).
     save_ctx(p, frame);
     p->wait_status_ptr = status_ptr;
     p->wait_status_is_linux = true; // encode as Linux wait status on delivery
-    const int next = esper_park_and_pick(idx);
+    // Park as a GENERIC wait4 waiter so a child's exit takes the REAP branch in
+    // maybe_wake_parent (parent_is_in_wait4_locked). That predicate requires
+    // ipc_wait_kind==None && wait_pipe_idx<0 && !wait_futex && wake_cntpct==0;
+    // those fields can carry STALE values from this Esper's PREVIOUS park (e.g.
+    // ConsoleRead, set while the shell read the command line) -- which makes the
+    // predicate false, so the child takes the SIGCHLD branch instead of reaping,
+    // waitpid returns -EINTR, and ash's dowait retries forever (the `cmd & wait`
+    // hang). Clear them so this is unambiguously a wait4 park.
+    p->ipc_wait_kind = Esper::IpcWaitKind::None;
+    p->wait_pipe_idx = -1;
+    p->wait_futex = false;
+    p->wake_cntpct = 0;
+    const int next = esper_park_and_pick_locked(idx);
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
     if (next < 0) {
-        // No other Esper is runnable right now, but we ARE legitimately
-        // parked (state=waiting) with live children -- a child's exit will
-        // wake us via exit_and_schedule. Return to run_espers's WFI loop
-        // instead of falsely reporting ECHILD. (The old "unpark + return
-        // -ECHILD" was a single-core hack; under vfork the parent now
-        // resumes only after the child has already parked, so this path is
-        // hit normally and the bogus ECHILD made busybox login/sh exit.)
+        // No other Esper is runnable right now, but we ARE legitimately parked
+        // (state=waiting) with live children -- a child's exit wakes us via
+        // maybe_wake_parent_locked. Return to run_espers's WFI loop instead of
+        // falsely reporting ECHILD.
         leave_user();
         __builtin_unreachable();
     }
     load_ctx(esper_at(static_cast<uint32_t>(next)), frame);
+}
+
+// ===================== ptrace "Mental Out" =====================
+// Named for Shokuhou Misaki's Mental Out (心理掌握): read another mind (PEEK),
+// rewrite it (POKE), and puppeteer the body (CONT / single-step). A tracer
+// attaches to a tracee; the tracee ptrace-stops (parks on PtraceStop, which no
+// generic wake touches -- only the tracer resumes it) and reports each stop to
+// the tracer's wait4. See the intercept in linux_deliver_signal_locked.
+
+namespace {
+// True if `p` is parked in a generic wait4 (mirrors esper.cpp's
+// parent_is_in_wait4_locked, which has internal linkage there). Used to pre-set
+// the tracer's wait4 result when a tracee stops.
+bool mental_out_tracer_in_wait4(const Esper &p) {
+    return p.state == EsperState::waiting && p.wait_pipe_idx < 0 &&
+           p.ipc_wait_kind == Esper::IpcWaitKind::None && !p.wait_futex &&
+           p.wake_cntpct == 0;
+}
+// PTRACE request numbers (Linux uapi/ptrace.h; aarch64 uses GETREGSET, not GETREGS).
+constexpr long kPtTraceme    = 0;
+constexpr long kPtPeektext   = 1;
+constexpr long kPtPeekdata   = 2;
+constexpr long kPtPoketext   = 4;
+constexpr long kPtPokedata   = 5;
+constexpr long kPtCont       = 7;
+constexpr long kPtKill       = 8;
+constexpr long kPtSinglestep = 9;
+constexpr long kPtAttach     = 16;
+constexpr long kPtDetach     = 17;
+constexpr long kPtSyscall    = 24;
+constexpr long kPtSetoptions = 0x4200;
+constexpr long kPtGetsiginfo = 0x4202;
+constexpr long kPtGetregset  = 0x4204;
+constexpr long kPtSetregset  = 0x4205;
+constexpr long kPtSeize      = 0x4206;
+constexpr uint32_t kNtPrstatus      = 1; // GETREGSET/SETREGSET: GP register set
+constexpr uint32_t kPtOTracesysgood = 1; // PTRACE_O_TRACESYSGOOD
+constexpr int kSigStop = 19, kSigTrap = 5;
+
+// The Esper this tracer (slot) is tracing that carries this pid.
+Esper *mental_out_tracee_of(int tracer_idx, uint32_t pid) {
+    for (uint32_t i = 0; i < kMaxEspers; ++i) {
+        Esper *t = esper_at(i);
+        if (t != nullptr && t->pid == pid && t->ptrace_tracer == tracer_idx &&
+            t->state != EsperState::free) {
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+// Syscall-stop signal: SIGTRAP, or SIGTRAP|0x80 when PTRACE_O_TRACESYSGOOD is set
+// (lets the tracer distinguish syscall-stops from genuine SIGTRAPs).
+int mental_out_syscall_sig(const Esper *t) {
+    return (t->ptrace_options & kPtOTracesysgood) ? (kSigTrap | 0x80) : kSigTrap;
+}
+} // namespace
+
+// Park the currently-running tracee `idx` in a ptrace-stop reporting `sig`, wake
+// the tracer's wait4 (or SIGCHLD it), and switch to the next runnable Esper.
+// rewind_elr re-executes the trapping svc on resume (syscall-entry-stop, which
+// must re-run the syscall); the signal/exit stops leave elr so resume continues
+// past the current point. Returns having switched away (caller just returns).
+void mental_out_stop(int idx, int sig, uint32_t event, uint64_t *frame, bool rewind_elr) {
+    Esper *t = esper_at(static_cast<uint32_t>(idx));
+    if (t == nullptr) return;
+    save_ctx(t, frame);
+    if (rewind_elr) t->elr -= 4; // replay the svc on resume (syscall-entry-stop)
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    t->ptrace_stopped = true;
+    t->ptrace_report = true;
+    t->ptrace_stop_sig = sig;
+    t->ptrace_event = event;
+    t->ipc_wait_kind = Esper::IpcWaitKind::PtraceStop;
+    t->ipc_wait_id = -1;
+    Esper *tr = (t->ptrace_tracer >= 0)
+                    ? esper_at(static_cast<uint32_t>(t->ptrace_tracer)) : nullptr;
+    if (tr != nullptr) {
+        if (mental_out_tracer_in_wait4(*tr)) {
+            tr->regs[0] = t->pid;
+            tr->pending_status = sig;
+            tr->wait_status_is_stop = true;
+            tr->has_pending_status = (tr->wait_status_ptr != 0);
+            tr->state = EsperState::ready;
+        } else {
+            const uint64_t chld = tr->sig_handler[17 /*SIGCHLD*/];
+            if (chld != 0 && chld != 1)
+                linux_deliver_signal_locked(tr, 17, nullptr);
+        }
+    }
+    const int next = esper_park_and_pick_locked(idx);
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
+    esper_kick_secondaries();
+    if (next < 0) {
+        leave_user();
+        __builtin_unreachable();
+    }
+    load_ctx(esper_at(static_cast<uint32_t>(next)), frame);
+}
+
+// Syscall-return drain hook: if the running tracee has a pending ptrace-stop
+// (a signal the intercept absorbed), park it in a signal-stop. Returns true if
+// it stopped (caller must just return -- we switched away).
+bool mental_out_check_stop(int idx, uint64_t *frame) {
+    Esper *me = esper_at(static_cast<uint32_t>(idx));
+    if (me == nullptr || me->ptrace_tracer < 0) return false;
+    // Read pending_stop + clear the absorbed sig_pending bit under g_esper_lock:
+    // a cross-CPU signal sender mutates sig_pending under the same lock (the Mental
+    // Out intercept in linux_deliver_signal_locked), so an unlocked &= here could
+    // lose a concurrently-set bit. Mirrors Linux taking the sighand siglock.
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    const int sig = me->ptrace_pending_stop;
+    if (sig != 0) {
+        me->ptrace_pending_stop = 0;
+        me->sig_pending &= ~(1ULL << (sig - 1)); // absorbed into the stop (CONT re-injects)
+    }
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
+    if (sig == 0) return false;
+    mental_out_stop(idx, sig, 0, frame, /*rewind_elr=*/false);
+    return true;
+}
+
+// PTRACE_SYSCALL entry/exit-stop. entry=true is called before the syscall runs
+// (rewinds elr so the syscall re-runs on resume); entry=false after it ran.
+// Returns true if it stopped.
+bool mental_out_syscall_trap(int idx, uint64_t *frame, bool entry) {
+    Esper *me = esper_at(static_cast<uint32_t>(idx));
+    if (me == nullptr || me->ptrace_tracer < 0 || !me->ptrace_syscall) return false;
+    if (entry) {
+        if (me->ptrace_in_syscall) return false; // already past entry (replay)
+        me->ptrace_in_syscall = true;
+        mental_out_stop(idx, mental_out_syscall_sig(me), 0, frame, /*rewind_elr=*/true);
+        return true;
+    }
+    if (!me->ptrace_in_syscall) return false;
+    me->ptrace_in_syscall = false;
+    mental_out_stop(idx, mental_out_syscall_sig(me), 0, frame, /*rewind_elr=*/false);
+    return true;
+}
+
+// Resume a stopped tracee with a new run mode. inject_sig (CONT/SYSCALL data) is
+// re-delivered to the tracee (passing the Mental Out intercept once).
+static void mental_out_resume(Esper *t, bool single_step, bool syscall_mode, int inject_sig) {
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    t->ptrace_stopped = false;
+    t->ptrace_report = false;
+    t->ptrace_singlestep = single_step;
+    t->ptrace_syscall = syscall_mode;
+    // A non-PTRACE_SYSCALL resume (CONT/SINGLESTEP/DETACH) ends any in-progress
+    // syscall-stop sequence: the syscall runs to completion during the free run,
+    // so the next PTRACE_SYSCALL must start fresh at an ENTRY stop. Without this
+    // reset, CONT'ing out of an entry-stop leaves ptrace_in_syscall==true and the
+    // next syscall-entry is mis-reported as an exit-stop (toggle desync).
+    if (!syscall_mode) t->ptrace_in_syscall = false;
+    if (inject_sig > 0 && inject_sig < 64) {
+        t->ptrace_inject_sig = inject_sig;
+        t->sig_pending |= (1ULL << (inject_sig - 1));
+    }
+    if (t->state == EsperState::waiting &&
+        t->ipc_wait_kind == Esper::IpcWaitKind::PtraceStop) {
+        t->ipc_wait_kind = Esper::IpcWaitKind::None;
+        t->ipc_wait_id = -1;
+        t->state = EsperState::ready;
+    }
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
+    esper_kick_secondaries();
+}
+
+// ptrace(request, pid, addr, data). tracer_idx is the calling Esper's slot.
+void linux_ptrace(int tracer_idx, uint64_t *frame) {
+    Esper *tracer = esper_at(static_cast<uint32_t>(tracer_idx));
+    if (tracer == nullptr) { frame[0] = static_cast<uint64_t>(-3); return; } // -ESRCH
+    const long request = static_cast<long>(frame[0]);
+    const uint32_t pid = static_cast<uint32_t>(frame[1]);
+    const uint64_t addr = frame[2];
+    const uint64_t data = frame[3];
+
+    // PTRACE_TRACEME: the caller marks itself traced by its parent. No stop yet
+    // -- the next signal/exec is where it first reports.
+    if (request == kPtTraceme) {
+        tracer->ptrace_tracer = tracer->parent;
+        tracer->ptrace_in_syscall = false;
+        frame[0] = 0;
+        return;
+    }
+
+    // ATTACH/SEIZE create the trace relationship for a running/ready tracee.
+    if (request == kPtAttach || request == kPtSeize) {
+        Esper *t = nullptr;
+        for (uint32_t i = 0; i < kMaxEspers; ++i) {
+            Esper *c = esper_at(i);
+            if (c != nullptr && c->pid == pid && c->state != EsperState::free &&
+                c->state != EsperState::exited && c->state != EsperState::faulted) {
+                t = c; break;
+            }
+        }
+        if (t == nullptr) { frame[0] = static_cast<uint64_t>(-3); return; } // -ESRCH
+        if (t->ptrace_tracer >= 0) { frame[0] = static_cast<uint64_t>(-1); return; } // -EPERM
+        t->ptrace_tracer = tracer_idx;
+        t->ptrace_in_syscall = false;
+        if (request == kPtSeize) {
+            t->ptrace_options = static_cast<uint32_t>(data);
+        } else {
+            // ATTACH delivers a SIGSTOP so the tracee stops promptly; the
+            // intercept turns it into the first ptrace-stop.
+            if (t->ptrace_pending_stop == 0) t->ptrace_pending_stop = kSigStop;
+            t->sig_pending |= (1ULL << (kSigStop - 1));
+            const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+            if (t->state == EsperState::waiting && t->wait_pipe_idx < 0 &&
+                t->ipc_wait_kind != Esper::IpcWaitKind::PtraceStop) {
+                t->regs[0] = static_cast<uint64_t>(-4); // -EINTR a blocked syscall
+                t->ipc_wait_kind = Esper::IpcWaitKind::None;
+                t->ipc_wait_id = -1;
+                t->wake_cntpct = 0;
+                t->state = EsperState::ready;
+            }
+            anti_skill_unlock_irqrestore(g_esper_lock, flags);
+            esper_kick_secondaries();
+        }
+        frame[0] = 0;
+        return;
+    }
+
+    // All remaining requests target an established tracee identified by pid.
+    Esper *t = mental_out_tracee_of(tracer_idx, pid);
+    if (t == nullptr) { frame[0] = static_cast<uint64_t>(-3); return; } // -ESRCH
+
+    // Linux requires the tracee to be ptrace-stopped for every request except
+    // PTRACE_KILL: reading/writing its registers or memory, or resuming it, only
+    // makes sense at a stop. Enforcing this also prevents racing a tracee that is
+    // still running on another CPU (its saved regs/state would be stale).
+    if (request != kPtKill && !t->ptrace_stopped) {
+        frame[0] = static_cast<uint64_t>(-3); // -ESRCH
+        return;
+    }
+
+    switch (request) {
+    case kPtPeektext:
+    case kPtPeekdata: {
+        // Read one word from the tracee at addr; the raw syscall stores it to
+        // *data (in the tracer's address space) and returns 0.
+        uint64_t word = 0;
+        if (!pr2_read_user(t, addr, &word, sizeof(word))) {
+            frame[0] = static_cast<uint64_t>(-14); return; // -EFAULT
+        }
+        if (!pr2_write_user(tracer, data, &word, sizeof(word))) {
+            frame[0] = static_cast<uint64_t>(-14); return;
+        }
+        frame[0] = 0;
+        return;
+    }
+    case kPtPoketext:
+    case kPtPokedata: {
+        const uint64_t word = data;
+        frame[0] = pr2_write_user(t, addr, &word, sizeof(word))
+                       ? 0 : static_cast<uint64_t>(-14);
+        return;
+    }
+    case kPtGetregset: {
+        if (addr != kNtPrstatus) { frame[0] = static_cast<uint64_t>(-22); return; } // -EINVAL
+        // data -> struct iovec { void *base; size_t len }.
+        uint64_t iov[2] = {0, 0};
+        if (!pr2_read_user(tracer, data, iov, sizeof(iov))) {
+            frame[0] = static_cast<uint64_t>(-14); return;
+        }
+        uint64_t blob[34]; // x0..x30, sp, pc, pstate
+        for (uint32_t i = 0; i < 31; ++i) blob[i] = t->regs[i];
+        blob[31] = t->sp_el0;
+        blob[32] = t->elr;
+        blob[33] = t->spsr;
+        uint64_t len = iov[1];
+        if (len > sizeof(blob)) len = sizeof(blob);
+        if (iov[0] != 0 && !pr2_write_user(tracer, iov[0], blob, len)) {
+            frame[0] = static_cast<uint64_t>(-14); return;
+        }
+        iov[1] = len; // report bytes filled
+        pr2_write_user(tracer, data, iov, sizeof(iov));
+        frame[0] = 0;
+        return;
+    }
+    case kPtSetregset: {
+        if (addr != kNtPrstatus) { frame[0] = static_cast<uint64_t>(-22); return; }
+        uint64_t iov[2] = {0, 0};
+        if (!pr2_read_user(tracer, data, iov, sizeof(iov))) {
+            frame[0] = static_cast<uint64_t>(-14); return;
+        }
+        uint64_t blob[34];
+        uint64_t len = iov[1];
+        if (len > sizeof(blob)) len = sizeof(blob);
+        if (iov[0] == 0 || !pr2_read_user(tracer, iov[0], blob, len)) {
+            frame[0] = static_cast<uint64_t>(-14); return;
+        }
+        const uint32_t nwords = static_cast<uint32_t>(len / 8);
+        for (uint32_t i = 0; i < nwords && i < 31; ++i) t->regs[i] = blob[i];
+        if (nwords > 31) t->sp_el0 = blob[31];
+        if (nwords > 32) t->elr   = blob[32];
+        if (nwords > 33) {
+            // SECURITY: the tracer is EL0 and supplies blob[] verbatim. Restoring
+            // the tracee's PSTATE unsanitised would let any process (fork a child,
+            // child PTRACE_TRACEME, parent SETREGSET) set the tracee's spsr mode
+            // bits to EL1 -- on its next load_ctx eret the tracee would run at EL1
+            // = EL0->EL1 privilege escalation. Mirror Linux's valid_user_regs():
+            // keep only the condition flags (NZCV) and force every other bit to the
+            // canonical EL0 PSTATE (kSpsrEl0 = EL0t, IRQ-enabled, AArch64).
+            constexpr uint64_t kNzcvMask = 0xF0000000ULL;
+            t->spsr = (blob[33] & kNzcvMask) | (kSpsrEl0 & ~kNzcvMask);
+        }
+        frame[0] = 0;
+        return;
+    }
+    case kPtGetsiginfo: {
+        // Minimal siginfo: si_signo = the stop signal; rest zeroed (128 bytes).
+        uint8_t si[128];
+        for (uint32_t i = 0; i < sizeof(si); ++i) si[i] = 0;
+        *reinterpret_cast<int32_t *>(si) = t->ptrace_stop_sig;
+        frame[0] = pr2_write_user(tracer, data, si, sizeof(si))
+                       ? 0 : static_cast<uint64_t>(-14);
+        return;
+    }
+    case kPtSetoptions:
+        t->ptrace_options = static_cast<uint32_t>(data);
+        frame[0] = 0;
+        return;
+    case kPtCont:
+        mental_out_resume(t, /*single_step=*/false, /*syscall_mode=*/false, static_cast<int>(data));
+        frame[0] = 0;
+        return;
+    case kPtSyscall:
+        mental_out_resume(t, /*single_step=*/false, /*syscall_mode=*/true, static_cast<int>(data));
+        frame[0] = 0;
+        return;
+    case kPtSinglestep:
+        mental_out_resume(t, /*single_step=*/true, /*syscall_mode=*/false, static_cast<int>(data));
+        frame[0] = 0;
+        return;
+    case kPtDetach:
+        t->ptrace_tracer = -1;
+        t->ptrace_pending_stop = 0;
+        mental_out_resume(t, false, false, static_cast<int>(data));
+        frame[0] = 0;
+        return;
+    case kPtKill:
+        // Deprecated: resume the tracee with a pending SIGKILL. Inject it via
+        // mental_out_resume so sig_pending is set under g_esper_lock (SIGKILL is
+        // never trapped by the intercept, so it kills the tracee on resume).
+        mental_out_resume(t, false, false, 9 /*SIGKILL*/);
+        frame[0] = 0;
+        return;
+    default:
+        frame[0] = static_cast<uint64_t>(-38); // -ENOSYS for unhandled requests
+        return;
+    }
 }
 
 extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
@@ -2641,6 +3226,23 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
     g_last_user_el = (spsr >> 2) & 0x3;
 
     const uint32_t ec = static_cast<uint32_t>(esr >> kEsrEcShift);
+
+    // ptrace "Mental Out" single-step: the EL0 instruction retired with MDSCR.SS
+    // armed, so a Software Step exception (EC 0x32) re-trapped here. Disarm and
+    // re-stop the tracee with SIGTRAP for the tracer to collect; the next
+    // PTRACE_SINGLESTEP re-arms via load_ctx. A stray step (no stepping tracee)
+    // just disarms and resumes.
+    if (ec == kEcSoftStepLowerEl) {
+        mental_out_arm_step(false);
+        const int idx = esper_running_index();
+        Esper *me = (idx >= 0) ? esper_at(static_cast<uint32_t>(idx)) : nullptr;
+        if (me != nullptr && me->ptrace_tracer >= 0 && me->ptrace_singlestep) {
+            me->ptrace_singlestep = false; // consumed this step
+            mental_out_stop(idx, kSigTrap, 0, frame, /*rewind_elr=*/false);
+        }
+        return;
+    }
+
     if (ec == kEcSvc64) {
         const int idx = esper_running_index();
 
@@ -2652,9 +3254,18 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
             Esper *me = esper_at(static_cast<uint32_t>(idx));
             if (me != nullptr && me->abi == Abi::Linux) {
                 const uint64_t nr = frame[8];
+                // ptrace "Mental Out" syscall-entry-stop: a PTRACE_SYSCALL-resumed
+                // tracee stops BEFORE the syscall runs (rewinds elr so it re-runs
+                // on resume). Placed ahead of the specials so clone/wait4/etc. are
+                // trapped too. No-op unless this Esper is a traced tracee.
+                if (mental_out_syscall_trap(idx, frame, /*entry=*/true)) return;
                 // Process-control syscalls need the scheduler internals
                 // (save/load ctx, pick_ready), so they're handled here rather
                 // than in linux_abi.cpp. Everything else goes to the table.
+                if (nr == 117 /*ptrace*/) {
+                    linux_ptrace(idx, frame);
+                    return;
+                }
                 if (nr == 220 /*clone*/) {
                     linux_clone(idx, frame);
                     return;
@@ -2682,8 +3293,40 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
                         self->clear_child_tid = 0;
                         if (phys != 0) futex_wake_phys(phys, 1);
                     }
+                    // exit_group(94) kills the WHOLE thread group, not just the
+                    // caller (exit(93) kills only the caller). Without this,
+                    // java -version's worker (HotSpot VM thread, a CLONE_VM
+                    // sibling) stays runnable after main exits and the scheduler
+                    // resumes it into a stale ctx -> [EL0 FAULT] 0x44a654 and the
+                    // shell never gets its prompt back. Terminate every Esper
+                    // sharing this address space (same mm) the same way
+                    // exit_and_schedule cleans up the caller: drop pipe refs +
+                    // release the image (release_linux_image reality_unref's the
+                    // shared mm), then mark it exited so it's never resumed. (java
+                    // runs single-vCPU here so a sibling is never running on
+                    // another core; true SMP is separately blocked by gap 12.)
+                    if (nr == 94 /*exit_group*/ && self != nullptr && self->mm != nullptr) {
+                        for (uint32_t i = 0; i < kMaxEspers; ++i) {
+                            if (static_cast<int>(i) == idx) continue;
+                            Esper *o = esper_at(i);
+                            if (o != nullptr && o->mm == self->mm &&
+                                o->state != EsperState::free &&
+                                o->state != EsperState::exited &&
+                                o->state != EsperState::faulted) {
+                                release_esper_pipes(o);
+                                release_linux_image(o); // reality_unref + image_unref
+                                o->exit_code = static_cast<int64_t>(frame[0]);
+                                o->state = EsperState::exited;
+                            }
+                        }
+                    }
                     exit_and_schedule(idx, static_cast<int64_t>(frame[0]), frame);
                 }
+                // ptrace "Mental Out" post-syscall stops (no-op unless traced):
+                // (1) PTRACE_SYSCALL exit-stop, then (2) a signal the intercept
+                // absorbed into a pending ptrace signal-stop. Either switches away.
+                if (mental_out_syscall_trap(idx, frame, /*entry=*/false)) return;
+                if (mental_out_check_stop(idx, frame)) return;
                 return;
             }
         }
@@ -2751,7 +3394,7 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
                 return;
             }
             Esper *c = esper_at(child);
-            PersonalReality pr = personal_reality_fork(
+            PersonalRealityV1 pr = personal_reality_fork(
                 static_cast<uint32_t>(idx), static_cast<uint32_t>(child), p->code_pages);
             if (!pr.valid) {
                 c->state = EsperState::free;
@@ -3142,8 +3785,23 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
     // through to the existing "terminate the Esper" path.
     if (idx >= 0 && (ec == kEcDataAbortLowerEl || ec == kEcInstrAbortLowerEl)) {
         Esper *cur = esper_at(static_cast<uint32_t>(idx));
-        if (cur != nullptr && cur->abi == Abi::Linux && pr2_handle_fault(cur, far)) {
-            return; // page populated; retry on eret
+        if (cur != nullptr && cur->abi == Abi::Linux) {
+            // Fault-loop guard: pr2_handle_fault can "resolve" a fault (return
+            // true) that the eret then RE-faults on -- an unaligned access or a
+            // write to a page we leave read-only. That spins forever (100% CPU,
+            // silent) instead of progressing. If the SAME address keeps faulting,
+            // stop retrying: diagnose the ESR once and fall through to terminate
+            // (Linux would SIGSEGV/SIGBUS it). [FAULTLOOP] is a JVM-bringup probe.
+            static uint64_t lf = 0; static uint32_t ln = 0;
+            ln = (far == lf) ? (ln + 1) : 0; lf = far;
+            if (ln < 4000) {
+                if (pr2_handle_fault(cur, far)) return; // page populated; retry on eret
+            } else if (ln == 4000) {
+                district::write("\n[FAULTLOOP] far="); district::hex(far);
+                district::write(" esr="); district::hex(esr);
+                district::write(" elr="); district::hex(elr); district::writeln("");
+                // fall through to the [EL0 FAULT] terminate path -> breaks the spin
+            }
         }
     }
 
@@ -3160,16 +3818,47 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
             district::dec(bad->pid);
             district::write(" name ");
             district::write(bad->name);
+            // [gap12 diag] regs at fault: x30(LR)==ELR ⇒ ret to a smashed return
+            // address (stack wild-write); else a bad branch register. Localizes
+            // the HVF-SMP clone-thread wild-write source.
             // [WD] Walk the faulting VA to expose page-table corruption: a
             // level-1 perm fault whose L1 entry is garbage / a reused page is
             // the signature of a use-after-free of a table page under SMP.
             if (ec == kEcInstrAbortLowerEl || ec == kEcDataAbortLowerEl) {
                 district::writeln("");
                 pr2_dump_walk(bad->ttbr0, far);
+                pr2_dump_vma(bad, far); // [JVMDIAG] VMA prot for the faulting va
+                pr2_dump_all_vmas(bad); // [JVMDIAG] full VMA list (thread divergence?)
             }
         }
     }
     district::writeln("\n  Esper terminated; kernel survives.");
+    Esper *bad2 = (idx >= 0) ? esper_at(static_cast<uint32_t>(idx)) : nullptr;
+    PersonalReality *gmm = (bad2 != nullptr) ? bad2->mm : nullptr;
+    if (gmm != nullptr) {
+        // A fatal fault (SIGSEGV) in one CLONE_VM thread takes down the WHOLE
+        // thread group on Linux. Mark every sibling (same mm) exited + wake their
+        // wait4 parents, then release each sibling's resources. Order matters:
+        // the group-exit (which matches on mm) MUST run before release_linux_image
+        // (which reality_unref's, clearing o->mm). Without this, java -version's
+        // VM thread faulting on shutdown left the main thread blocked in join --
+        // or, once woken, resumed into the freed address space (vma_count=0). Now
+        // the whole JVM process exits and the shell gets its prompt back.
+        const int next = esper_group_exit_and_pick(idx, static_cast<const void *>(gmm),
+                                                   128 + 11 /*SIGSEGV*/);
+        for (uint32_t i = 0; i < kMaxEspers; ++i) {
+            Esper *o = esper_at(i);
+            if (o != nullptr && o->mm == gmm && o->state == EsperState::exited) {
+                release_esper_pipes(o);
+                release_linux_image(o); // reality_unref (clears o->mm) + image_unref
+            }
+        }
+        if (next < 0) {
+            leave_user();
+        }
+        load_ctx(esper_at(static_cast<uint32_t>(next)), frame);
+        return;
+    }
     if (idx >= 0) {
         release_esper_pipes(esper_at(idx)); // pipes get EOF/EPIPE before the slot is recycled
         release_linux_image(esper_at(idx)); // free retained ELF buffer (if Linux ABI)
@@ -3178,7 +3867,7 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
     if (next < 0) {
         leave_user();
     }
-    load_ctx(esper_at(next), frame);
+    load_ctx(esper_at(static_cast<uint32_t>(next)), frame);
 }
 
 void linux_exit_running(int idx, int64_t code, uint64_t *frame) {

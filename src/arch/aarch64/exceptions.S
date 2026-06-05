@@ -135,6 +135,28 @@ irq_entry:
     bl      irq_dispatch
 
     ldp     x0, x1,   [sp, #256]
+    // [ELRGUARD] If this IRQ is about to return to EL0 (saved SPSR M[3:0]==0)
+    // with a kernel-range PC, the interrupted EL0 context is corrupt (the
+    // residual SMP wild-write that lands a secondary core in resume_user_eret).
+    // Don't eret into kernel text at EL0: reset TTBR0, fault this CPU's Esper,
+    // and unwind to the scheduler via leave_user (the Esper was resumed via
+    // enter_user/resume_user_eret so the per-CPU kctx slot unwinds cleanly --
+    // identical divert to resume_user_eret). EL1-interrupt returns (M!=0, a
+    // legitimate kernel PC) skip the check. x2/x3 are restored below.
+    and     x2, x1, #0xf
+    cbnz    x2, .Lirq_eret_ok          // returning to EL1 -> kernel PC is fine
+    movz    x2, #0x80, lsl #32         // 0x80_0000_0000 = 39-bit EL0 VA ceiling
+    cmp     x0, x2
+    blo     .Lirq_eret_ok              // EL0 PC is a user VA -> normal return
+    bl      kernel_ttbr0_phys
+    msr     ttbr0_el1, x0
+    dsb     ish
+    tlbi    vmalle1is
+    dsb     ish
+    isb
+    bl      resume_user_elr_corrupt    // fault the corrupt Esper (logs [ELRGUARD-asm])
+    b       leave_user                 // unwind to scheduler; re-pick a clean Esper
+.Lirq_eret_ok:
     msr     elr_el1, x0
     msr     spsr_el1, x1
     ldp     x0, x1,   [sp, #16 * 0]
@@ -188,6 +210,25 @@ el0_sync_entry:
     mov     x1, sp
     bl      el0_sync_dispatch
 
+    // [ELRGUARD] el0_sync_entry erets to EL0 via the LIVE elr_el1 (svc+4, or a
+    // signal-handler entry the dispatcher MSR'd). If that is a kernel-range PC,
+    // the EL0 return context is corrupt (the residual SMP wild-write) -- don't
+    // eret into kernel text: reset TTBR0, fault this CPU's Esper, and unwind via
+    // leave_user (same divert as resume_user_eret). Always an EL0 return here so
+    // no SPSR check is needed. x9/x10 are restored from the frame below.
+    mrs     x9, elr_el1
+    movz    x10, #0x80, lsl #32        // 0x80_0000_0000 = 39-bit EL0 VA ceiling
+    cmp     x9, x10
+    blo     .Lel0_sync_ok             // EL0 PC is a user VA -> normal return
+    bl      kernel_ttbr0_phys
+    msr     ttbr0_el1, x0
+    dsb     ish
+    tlbi    vmalle1is
+    dsb     ish
+    isb
+    bl      resume_user_elr_corrupt    // fault the corrupt Esper (logs [ELRGUARD-asm])
+    b       leave_user                 // unwind to scheduler; re-pick a clean Esper
+.Lel0_sync_ok:
     ldp     x0, x1,   [sp, #16 * 0]
     ldp     x2, x3,   [sp, #16 * 1]
     ldp     x4, x5,   [sp, #16 * 2]

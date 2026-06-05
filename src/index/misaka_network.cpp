@@ -332,6 +332,11 @@ void network_tick(uint64_t *frame) {
         // it hasn't, parked ppoll/pselect waiters must re-check periodically
         // (mirrors Linux poll() being driven by the scheduler + softirqs).
         linux_ipc_wake(Esper::IpcWaitKind::PollWait, -1);
+        // Same for epoll_pwait: a timerfd registered in an epoll set becomes
+        // readable purely by CNTPCT advancing (no producer event, no IRQ), so a
+        // parked epoll waiter must be re-kicked every tick to re-scan + honour its
+        // timeout -- without this an epoll on a timerfd hangs forever (SMP=1 froze).
+        linux_ipc_wake(Esper::IpcWaitKind::EpollWait, -1);
         // [WD] Hang diagnosis: while a TCP connection is live (not just the
         // listen socket -- antenna_has_active_socket excludes Listen), snapshot
         // every esper's wait state + the pty rings + sockets every ~2 s. The

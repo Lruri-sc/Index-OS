@@ -499,11 +499,25 @@ const char *handle_inbound(const uint8_t *f, uint32_t len) {
                     const uint8_t *src_ip = ip + 12;
                     const uint16_t id = rbe16(icmp + 4);
                     const uint16_t seq = rbe16(icmp + 6);
-                    uint8_t out[1600];
-                    uint32_t n = build_icmp(out, f + 6, src_ip, 0, id, seq,
-                                            icmp + 8, rbe16(ip + 2) - ihl - 8);
-                    net_tx(out, n);
-                    return "ICMP echo -> replied";
+                    // The echo payload length comes from the IP header's
+                    // total-length field, which is attacker-controlled. Trust
+                    // it only after bounding it against the frame we actually
+                    // received -- a forged total (or one below ihl+8, which
+                    // underflows the subtraction to ~4 GiB) would otherwise
+                    // drive an unbounded copy into out[]. Mirrors the UDP/TCP
+                    // length checks below.
+                    const uint32_t ip_total = rbe16(ip + 2);
+                    if (ip_total >= ihl + 8 && ip_total <= len - 14) {
+                        uint32_t payload_len = ip_total - ihl - 8;
+                        uint8_t out[1600];
+                        // build_icmp prepends 14(eth)+20(ip)+8(icmp) bytes, so
+                        // the echoed payload must fit in the remaining space.
+                        if (payload_len > sizeof(out) - 42) payload_len = sizeof(out) - 42;
+                        uint32_t n = build_icmp(out, f + 6, src_ip, 0, id, seq,
+                                                icmp + 8, payload_len);
+                        net_tx(out, n);
+                        return "ICMP echo -> replied";
+                    }
                 }
             }
         } else if (ip[9] == kProtoUdp && len >= 14 + ihl + 8) {
