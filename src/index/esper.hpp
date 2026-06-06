@@ -406,7 +406,12 @@ struct Esper {
     uint32_t exec_envc = 0;
 };
 
-constexpr uint32_t kMaxEspers = 16;
+constexpr uint32_t kMaxEspers = 64; // global Esper pool (processes + threads).
+// Was 16, which openjdk25 overran: its default G1 GC + C1/C2 JIT compiler +
+// VM service threads create >16 native threads, exhausting the pool -> clone
+// fails -> "OutOfMemoryError: unable to create native thread". 64 covers a JVM's
+// thread set plus the system (init/sshd/login/sh). Scheduler loops scale with
+// this constexpr; 64 is still cheap. (openjdk8's Parallel GC stayed under 16.)
 
 // Create an Esper. Returns its table slot index, or -1 if full. The slot
 // starts in EsperState::waiting (no wait predicate set, so the scheduler

@@ -314,7 +314,8 @@ Underline underline_probe() {
     return disk;
 }
 
-bool underline_read(const Underline &disk, uint64_t sector, void *buffer) {
+bool underline_read(const Underline &disk, uint64_t sector, void *buffer,
+                    uint32_t bytes) {
     if (!disk.present) {
         return false;
     }
@@ -330,7 +331,7 @@ bool underline_read(const Underline &disk, uint64_t sector, void *buffer) {
     g_desc[0].next = 1;
 
     g_desc[1].addr = phys(buffer);
-    g_desc[1].len = kUnderlineSectorSize;
+    g_desc[1].len = bytes; // multi-sector: device reads bytes/512 sectors at once
     g_desc[1].flags = kDescNext | kDescWrite;
     g_desc[1].next = 2;
 

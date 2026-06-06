@@ -29,8 +29,13 @@ struct Underline {
 Underline underline_probe();
 const Underline &underline_status();
 
-// Read one 512-byte sector into `buffer`. Returns false on error/timeout.
-bool underline_read(const Underline &disk, uint64_t sector, void *buffer);
+// Read `bytes` (a multiple of 512; default one sector) starting at `sector`
+// into `buffer`, in ONE virtio request. Reading a 4 KB ext2 block is a single
+// request, not 8 per-sector requests -> 8x fewer requests + busy-polls (this
+// per-sector loop dominated java startup). `buffer` must be physically
+// contiguous over the whole length (the kernel's static block buffers are).
+bool underline_read(const Underline &disk, uint64_t sector, void *buffer,
+                    uint32_t bytes = kUnderlineSectorSize);
 
 // Write one 512-byte sector from `buffer` to the disk. Returns false on
 // error/timeout. The buffer must be a full sector; partial updates are

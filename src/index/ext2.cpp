@@ -48,7 +48,13 @@ alignas(16) uint8_t g_inode[256];       // one inode
 // through (write_block updates the line) keeps it coherent with the disk. Safe
 // under the FsGuard that serializes all Lateran/ext2 access -- the same single-
 // threading the g_blk/g_ind scratch buffers above already rely on.
-constexpr uint32_t kBlkCacheN = 512; // 512 lines * 4 KB = 2 MB
+constexpr uint32_t kBlkCacheN = 8192; // 8192 lines * 4 KB = 32 MB. The old 2 MB
+// (512 lines) direct-mapped cache thrashed on java: rt.jar's blocks collided
+// heavily into 512 lines, so the same blocks missed + re-read off disk ~10x
+// (measured 91804 reads = 358 MB for a 33 MB jar). 32 MB keeps the jar working
+// set resident -> ~10x fewer disk reads (and far less virtio-blk busy-poll, which
+// dominates java startup). 32 MB BSS is fine in a 1 GB guest. Paired with a 4 KB
+// block ext2 image so each 4 KB cache line holds exactly one block (no waste).
 struct BlkCacheLine { uint32_t block; bool valid; };
 BlkCacheLine g_bc_meta[kBlkCacheN];
 alignas(16) uint8_t g_bc_data[kBlkCacheN][kMaxBlock];
@@ -78,10 +84,11 @@ bool read_block(uint32_t block, uint8_t *dst) {
         return true;
     }
     const uint32_t spb = bs / kSector;
-    for (uint32_t s = 0; s < spb; ++s) {
-        if (!drivers::underline_read(disk(), static_cast<uint64_t>(block) * spb + s, dst + s * kSector)) {
-            return false;
-        }
+    // ONE multi-sector virtio request for the whole block. Was spb per-sector
+    // requests (spb busy-polls per block; 8x for a 4 KB block) -- the dominant
+    // cost of java startup. dst is a kernel static block buffer (contiguous).
+    if (!drivers::underline_read(disk(), static_cast<uint64_t>(block) * spb, dst, bs)) {
+        return false;
     }
     bc_copy(g_bc_data[idx], dst, bs); // fill the line
     g_bc_meta[idx].block = block;

@@ -116,7 +116,7 @@ int esper_create(const char *name) {
     e.rlimits[3]  = { 8 * 1024 * 1024, kInf }; // STACK 8 MiB soft
     e.rlimits[4]  = { 0, kInf };             // CORE: 0 (no dumps by default)
     e.rlimits[5]  = { kInf, kInf };
-    e.rlimits[6]  = { 32, 32 };              // NPROC -- fewer Espers than Linux
+    e.rlimits[6]  = { 64, 64 };              // NPROC -- matches kMaxEspers pool
     e.rlimits[7]  = { kMaxFds, kMaxFds };    // NOFILE matches our fd table
     e.rlimits[8]  = { 64 * 1024, kInf };
     e.rlimits[9]  = { kInf, kInf };          // AS

@@ -1215,6 +1215,54 @@ void linux_syscall_dispatch(uint64_t *frame) {
         frame[0] = static_cast<uint64_t>(total);
         return;
     }
+    case 67 /*pread64*/: {
+        // pread64(fd, buf, count, offset): read at `offset` WITHOUT moving the
+        // fd position (POSIX). openjdk25's nio/zip uses it where openjdk8 used a
+        // plain read. Implement by save-seek-read-restore on the existing fd
+        // cursor (same primitives lseek uses). Mirrors Linux's pread64 contract.
+        const uint32_t fd = static_cast<uint32_t>(frame[0]);
+        const uint64_t buf = frame[1];
+        const uint64_t len = frame[2];
+        const uint64_t offset = frame[3];
+        if (!ensure_user(me, buf, len)) { frame[0] = static_cast<uint64_t>(-14); return; }
+        if (!linux_fd_is_file(me, fd)) { frame[0] = static_cast<uint64_t>(-29); return; } // -ESPIPE
+        const uint64_t save = linux_fd_tell(me, fd);
+        linux_fd_seek(me, fd, offset);
+        const int64_t r = linux_file_read(me, fd, reinterpret_cast<char *>(buf), len);
+        linux_fd_seek(me, fd, save); // restore: pread must not move the cursor
+        frame[0] = static_cast<uint64_t>(r);
+        return;
+    }
+    case 168 /*getcpu*/: {
+        // getcpu(*cpu, *node, tcache): current CPU + NUMA node. openjdk25's
+        // runtime queries it for thread/heap placement (openjdk8 didn't). tcache
+        // is ignored (Linux has since 2.6.24). Index is a single NUMA node (0).
+        const uint64_t cpu_va = frame[0];
+        const uint64_t node_va = frame[1];
+        if (cpu_va != 0) {
+            if (!ensure_user(me, cpu_va, 4)) { frame[0] = static_cast<uint64_t>(-14); return; }
+            *reinterpret_cast<uint32_t *>(cpu_va) = arch::this_cpu_id();
+        }
+        if (node_va != 0) {
+            if (!ensure_user(me, node_va, 4)) { frame[0] = static_cast<uint64_t>(-14); return; }
+            *reinterpret_cast<uint32_t *>(node_va) = 0;
+        }
+        frame[0] = 0;
+        return;
+    }
+    case 293 /*rseq*/:
+        // rseq (restartable sequences): glibc 2.35+ registers it for fast per-CPU
+        // ops. Index has no rseq; return -ENOSYS so glibc uses its non-rseq path
+        // (handled gracefully). Explicit so it skips the unknown-syscall warning.
+        // Mirrors a Linux kernel built without CONFIG_RSEQ.
+        frame[0] = static_cast<uint64_t>(-38); // -ENOSYS
+        return;
+    case 435 /*clone3*/:
+        // clone3: newer clone ABI. Index implements clone(220); glibc/musl fall
+        // back to clone() on -ENOSYS, so threads use the supported path. Mirrors
+        // an older Linux kernel that predates clone3.
+        frame[0] = static_cast<uint64_t>(-38); // -ENOSYS
+        return;
     case 62 /*lseek*/: {
         const uint64_t fd = frame[0];
         const int64_t off = static_cast<int64_t>(frame[1]);
@@ -2773,6 +2821,14 @@ void linux_syscall_dispatch(uint64_t *frame) {
             char *d = u + f * 65;
             for (uint32_t i = 0; i < 64 && s[i]; ++i) d[i] = s[i];
         }
+        frame[0] = 0;
+        return;
+    }
+    case 32 /*flock*/: {
+        // flock(fd, op): advisory whole-file lock. Index serializes all FS
+        // access under FsGuard (single-threaded disk path), so advisory locks
+        // are always uncontended -- accept as a no-op. openjdk's hsperfdata
+        // (perf data file) uses it; without it -version warned + skipped perf.
         frame[0] = 0;
         return;
     }
