@@ -111,39 +111,6 @@ make run-qemu-ext2-share SHARE_DIR=/path/on/host LLVM_PREFIX=/opt/homebrew/opt/l
 
 ---
 
-## 子系统命名（《魔法禁书目录》）
-
-| 子系统 | 角色 |
-| --- | --- |
-| `Necessarius` | 内核串口 shell |
-| `Imaginary Number District` | 控制台 / 早期输出 |
-| `ElectroMaster` | PL011 UART 驱动 |
-| `ArtificialHeaven` | DTB 扫描 + framebuffer |
-| `Othinus` | PSCI 电源控制（开/关/重启、CPU_ON） |
-| `Aleister` | GIC 中断控制器（v2/v3） |
-| `LastOrder` | ARM 通用（虚拟）定时器 / 心跳 |
-| `Teleport` | MMU / 地址翻译 / W^X / higher-half |
-| `MisakaNetwork` | 抢占式多核调度器 |
-| `Sister` / `Esper` | 内核线程 / EL0 用户进程 |
-| `Imprimatur` / `Judgement` / `RadioNoise` | 信号量 / 互斥锁 / 消息队列 |
-| `AntiSkill` | 自旋锁 |
-| `DarkMatter` | 可回收内核堆 |
-| `TreeDiagram` / `IndexLibrorum` | 物理页分配器 / 早期 bump 分配器 |
-| `PersonalReality` | 每进程地址空间（VMA + 按需分页 + CoW） |
-| `Underline` | virtio-blk 块设备（mmio + pci） |
-| `Underground` | PCIe 主桥 / ECAM 枚举 |
-| `Lateran` | 磁盘文件系统（ext2，回退 FAT16） |
-| `Bookshelf` / `GrimoireFS` | 可写 / 只读 内存文件系统 |
-| `StiylMagnus` | virtio-9p 主机目录共享 |
-| `MisakaMail` / `Antenna` | virtio-net 网卡 / 套接字层（UDP+TCP+DHCP+DNS） |
-| `RandomVector` / `Tsuchimikado` / `IdolTheory` | virtio-rng / virtio-serial / PL031 RTC |
-| `Aiwass` | EL0 进程间管道（pipe/dup/dup2） |
-| `Fortis931` | kill / 信号投递 |
-| `AcademyCity` | EL0 用户态共享迷你 libc |
-| `Testament` / `Kazakiri` / `Mental Out` | tmpfs / inotify / ptrace |
-
-> 命名只用于内核自家实体；Linux ABI 是外部标准，`linux_abi.cpp` 与 `Abi` 枚举用中性技术名。
-> uid 0 = `crowley`（不是 root）。
 
 ---
 
