@@ -868,6 +868,11 @@ void execute(const char *line, const ArtificialHeaven &heaven,
                                     TreeDiagram &tree) {
     using namespace imaginary_number_district;
 
+    // Now in the high half with a stable VBAR + a live scheduler: safe to arm the
+    // virtio-MMIO completion IRQ (arming it before the teleport hung -- the SPI was
+    // taken against a transient vector mid-VBAR-switch).
+    drivers::underline_enable_irq();
+
     // PID 1: try /sbin/init from the rootfs.  If it's there, hand the box
     // over to userspace -- run_elf only returns when every Esper has exited
     // (i.e. init crashed or chose to exit).  Falling through enters the

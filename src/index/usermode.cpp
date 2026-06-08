@@ -932,22 +932,15 @@ static inline bool dbg_in_ktext(uint64_t v) {
 }
 static inline void dbg_check_ctx(const char *tag, const Esper *e) {
     if (e == nullptr || e->abi != Abi::Linux || !e->started) return;
-    // A Linux user context must never hold a kernel-text pointer. Flag elr or
-    // any GP reg that landed in kernel text -- that value was corrupted into the
-    // saved/restored user context. SAVE vs LOAD localizes user-space (the user
-    // already had it at trap) vs kernel-overwrote-between-save-and-resume.
-    int bad = -2;
-    if (dbg_in_ktext(e->elr)) bad = -1;
-    else for (int i = 0; i < 31; ++i) if (dbg_in_ktext(e->regs[i])) { bad = i; break; }
-    if (bad == -2) return;
-    namespace district = imaginary_number_district;
-    district::write(tag);
-    district::write(" pid="); district::dec(e->pid);
-    district::write(" badreg="); district::dec(static_cast<uint64_t>(static_cast<uint32_t>(bad)));
-    district::write(" elr="); district::hex(e->elr);
-    district::write(" x30="); district::hex(e->regs[30]);
-    district::write(" "); district::write(e->name);
-    district::write("\n");
+    // DISABLED -- this was a FALSE-POSITIVE detector. dbg_in_ktext tested the LOW
+    // identity range [0x40080000,0x400b9000), which OVERLAPS valid user addresses:
+    // the JVM legitimately holds e.g. 0x4009a012 in x6 at one code site (0x...12
+    // isn't 4-byte aligned -> it's data, not a code pointer), so it tripped every
+    // time and spammed the console (a known Heisenbug) -- which slowed and likely
+    // destabilized multithreaded javac. It only ever PRINTED, never repaired the
+    // context, so disabling it is purely subtractive. (A real kernel-pointer leak
+    // would be a HIGH VA 0xffffff80..., which this low-range check never caught.)
+    (void)tag;
 }
 
 void save_ctx(Esper *e, const uint64_t *frame) {
@@ -1187,6 +1180,26 @@ int linux_dup_fd(Esper *e, int oldfd) {
     return -24; // -EMFILE
 }
 
+// F_DUPFD: like linux_dup_fd, but the new fd must be the lowest free one >= minfd.
+// busybox ash relies on this to relocate its script fd to a high number (>=10)
+// before reading the script; the old fcntl stub returned 0, so ash then read its
+// "script" from fd 0 (the console) and hung in an interactive ppoll loop.
+int linux_dup_fd_from(Esper *e, int oldfd, int minfd) {
+    if (e == nullptr || oldfd < 0 || static_cast<uint32_t>(oldfd) >= kMaxFds ||
+        e->fds[oldfd].kind == FdKind::closed) {
+        return -9; // -EBADF
+    }
+    if (minfd < 0) minfd = 0;
+    for (uint32_t i = static_cast<uint32_t>(minfd); i < kMaxFds; ++i) {
+        if (e->fds[i].kind == FdKind::closed) {
+            e->fds[i] = e->fds[oldfd];
+            linux_ref_fd_backend(e->fds[i]);
+            return static_cast<int>(i);
+        }
+    }
+    return -24; // -EMFILE
+}
+
 int linux_dup3_fd(Esper *e, int oldfd, int newfd, uint64_t /*flags*/) {
     if (e == nullptr || oldfd < 0 || newfd < 0 ||
         static_cast<uint32_t>(oldfd) >= kMaxFds ||
@@ -1339,10 +1352,71 @@ bool linux_execve_replace(int idx, const char *path, const char *const *user_arg
         }
         return false; // string longer than the staging buffer
     };
+    // Stage a KERNEL string (always mapped). stage_str classifies any pointer
+    // below the 39-bit user ceiling as a user pointer and prefaults it; but the
+    // kernel stack lives in the low identity-mapped VA range (also < ceiling), so
+    // kernel-stack strings (shebang interp/arg/script-path) would be mis-prefaulted
+    // against the user mm and fail. Copy them directly instead.
+    auto stage_kstr = [&](const char *src, const char **dst) -> bool {
+        if (src == nullptr) return false;
+        char *start = stage + pos;
+        while (pos + 1 < kStageSize) {
+            const char c = *src++;
+            stage[pos++] = c;
+            if (c == 0) { *dst = start; return true; }
+        }
+        return false;
+    };
+    // --- Shebang (#!) support (mirrors Linux binfmt_script) ----------------
+    // If `path` is a "#!interp [arg]" text script, run the interpreter instead,
+    // with argv = [interp, (arg,) script_path, original argv[1..]]. Index used to
+    // only load ELF, so scripts died with "exec: not an ELF file" (which broke the
+    // java AppCDS wrapper -- and every shell script). One level deep, as Linux
+    // does by default. Non-scripts fall straight through (header isn't "#!").
+    const char *real_path = path;
+    const char *const *use_argv = user_argv;
+    uint32_t use_argc = argc;
+    uint32_t kbase = 0; // # of leading kernel-string args (shebang interp/arg/path)
+    char sb_interp[128];
+    char sb_arg[128];
+    const char *sb_argv[kExecArgvCap];
+    {
+        char hdr[160];
+        int64_t hl = read_named_file(path, hdr, sizeof(hdr) - 1);
+        if (hl >= 2 && hdr[0] == '#' && hdr[1] == '!') {
+            uint32_t p = 2;
+            while (p < static_cast<uint32_t>(hl) && (hdr[p] == ' ' || hdr[p] == '\t')) ++p;
+            uint32_t in = 0;
+            while (p < static_cast<uint32_t>(hl) && hdr[p] != ' ' && hdr[p] != '\t' &&
+                   hdr[p] != '\n' && hdr[p] != '\r' && in + 1 < sizeof(sb_interp))
+                sb_interp[in++] = hdr[p++];
+            sb_interp[in] = 0;
+            while (p < static_cast<uint32_t>(hl) && (hdr[p] == ' ' || hdr[p] == '\t')) ++p;
+            uint32_t an = 0; // optional single argument = rest of the first line
+            while (p < static_cast<uint32_t>(hl) && hdr[p] != '\n' && hdr[p] != '\r' &&
+                   an + 1 < sizeof(sb_arg))
+                sb_arg[an++] = hdr[p++];
+            sb_arg[an] = 0;
+            if (in > 0) {
+                uint32_t k = 0;
+                sb_argv[k++] = sb_interp;
+                if (an > 0) sb_argv[k++] = sb_arg;
+                sb_argv[k++] = path; // the script path itself
+                kbase = k; // [0,kbase) are kernel strings; the rest are user argv
+                for (uint32_t i = 1; i < argc && k < kExecArgvCap; ++i)
+                    sb_argv[k++] = user_argv[i];
+                use_argv = sb_argv;
+                use_argc = k;
+                real_path = sb_interp;
+            }
+        }
+    }
     e->exec_argc = 0;
     e->exec_envc = 0;
-    for (uint32_t i = 0; i < argc && i < kExecArgvCap; ++i) {
-        if (!stage_str(user_argv[i], &e->exec_argv[i])) {
+    for (uint32_t i = 0; i < use_argc && i < kExecArgvCap; ++i) {
+        const bool ok = (i < kbase) ? stage_kstr(use_argv[i], &e->exec_argv[i])
+                                    : stage_str(use_argv[i], &e->exec_argv[i]);
+        if (!ok) {
             dark_matter_free(stage);
             e->exec_argc = 0;
             return false;
@@ -1358,7 +1432,7 @@ bool linux_execve_replace(int idx, const char *path, const char *const *user_arg
         }
         ++e->exec_envc;
     }
-    if (!load_elf_into_slot(static_cast<uint32_t>(idx), path)) {
+    if (!load_elf_into_slot(static_cast<uint32_t>(idx), real_path)) {
         dark_matter_free(stage);
         e->exec_argc = 0;
         e->exec_envc = 0;
@@ -3305,20 +3379,35 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
                     // shared mm), then mark it exited so it's never resumed. (java
                     // runs single-vCPU here so a sibling is never running on
                     // another core; true SMP is separately blocked by gap 12.)
+                    // exit_group(94): tear down the WHOLE thread group the SAME way
+                    // the fatal-fault path does -- esper_group_exit_and_pick marks
+                    // every same-mm sibling exited AND WAKES THEIR wait4 parents,
+                    // then we release each one's resources. The OLD manual loop here
+                    // marked siblings exited but never woke their parents: clone()
+                    // makes the JVM's "threads" child PROCESSES (no CLONE_THREAD
+                    // group), so when exit_group came from a clone child (javac's
+                    // exit-code thread is pid 11) whose own parent (the JVM launcher
+                    // pid 7, same mm) this loop ALSO marked exited, the shell waiting
+                    // on pid 7 was never woken -> `javac` hung after printing usage.
+                    // Routing through the mm-group teardown wakes that waiter.
                     if (nr == 94 /*exit_group*/ && self != nullptr && self->mm != nullptr) {
+                        PersonalReality *gmm = self->mm;
+                        const int next = esper_group_exit_and_pick(
+                            idx, static_cast<const void *>(gmm),
+                            static_cast<int64_t>(frame[0]));
                         for (uint32_t i = 0; i < kMaxEspers; ++i) {
-                            if (static_cast<int>(i) == idx) continue;
                             Esper *o = esper_at(i);
-                            if (o != nullptr && o->mm == self->mm &&
-                                o->state != EsperState::free &&
-                                o->state != EsperState::exited &&
-                                o->state != EsperState::faulted) {
+                            if (o != nullptr && o->mm == gmm &&
+                                o->state == EsperState::exited) {
                                 release_esper_pipes(o);
-                                release_linux_image(o); // reality_unref + image_unref
-                                o->exit_code = static_cast<int64_t>(frame[0]);
-                                o->state = EsperState::exited;
+                                release_linux_image(o); // reality_unref(clears mm)+unref
                             }
                         }
+                        if (next < 0) {
+                            leave_user();
+                        }
+                        load_ctx(esper_at(static_cast<uint32_t>(next)), frame);
+                        return;
                     }
                     exit_and_schedule(idx, static_cast<int64_t>(frame[0]), frame);
                 }

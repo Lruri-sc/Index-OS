@@ -42,4 +42,9 @@ bool underline_read(const Underline &disk, uint64_t sector, void *buffer,
 // read-modify-write at the caller.
 bool underline_write(const Underline &disk, uint64_t sector, const void *buffer);
 
+// Arm the virtio-MMIO completion IRQ. Call only AFTER the high-half teleport +
+// scheduler bring-up (enabling it during early boot / across the teleport hung).
+void underline_enable_irq();
+uint32_t underline_irq_count(); // completion IRQs handled (for /proc/interrupts)
+
 } // namespace index::drivers

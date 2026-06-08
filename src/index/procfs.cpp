@@ -1,8 +1,10 @@
 #include "index/procfs.hpp"
 
 #include "drivers/stiyl_magnus.hpp"
+#include "drivers/underline.hpp" // virtio-blk completion IRQ count for /proc/interrupts
 #include "index/dark_matter.hpp"
 #include "index/esper.hpp"
+#include "index/idol_theory.hpp" // RTC epoch for /proc/stat btime
 #include "index/imaginary_number_district.hpp"
 #include "index/last_order.hpp"
 #include "index/misaka_network.hpp"
@@ -354,6 +356,66 @@ uint32_t gen_pid_stat(Esper *me, char *buf, uint32_t cap) {
     return o;
 }
 
+// /proc/interrupts -- per-IRQ counters. arch_timer PPI (INTID 27) tick count and
+// the virtio-blk used-buffer completion SPI (INTID 48) handled count are both real.
+// Columns mirror Linux: INTID, per-CPU count, controller, name.
+uint32_t gen_interrupts(char *buf, uint32_t cap) {
+    uint32_t o = 0;
+    o = append(buf, cap, o, "           CPU0\n");
+    o = append(buf, cap, o, " 27: ");
+    o = append_u64(buf, cap, o, last_order_ticks());
+    o = append(buf, cap, o, "  GICv3  27 Level     arch_timer\n");
+    o = append(buf, cap, o, " 48: ");
+    o = append_u64(buf, cap, o, drivers::underline_irq_count());
+    o = append(buf, cap, o, "  GICv3  48 Level     virtio0-req\n");
+    return o;
+}
+
+// /proc/stat -- system-wide kernel/CPU stats that top, vmstat, and htop read for
+// aggregate CPU% (they diff the cpu line over time). Index has no per-mode CPU
+// accounting, so all elapsed jiffies are reported as idle (USER_HZ == our 100 Hz
+// LastOrder tick). intr/ctxt grow with ticks so the deltas tools compute are sane;
+// btime is the real boot wall-clock (RTC epoch minus uptime).
+uint32_t gen_stat(char *buf, uint32_t cap) {
+    const uint64_t ticks = last_order_ticks();          // USER_HZ (100 Hz) jiffies
+    const uint32_t cores = misaka_network_online_cpus();
+    const uint32_t ncpu = cores ? cores : 1;
+    const uint64_t epoch = idol_theory_epoch_seconds();
+    const uint64_t up_sec = ticks / 100;
+    const uint64_t btime = (epoch > up_sec) ? (epoch - up_sec) : 0;
+    uint32_t o = 0;
+    o = append(buf, cap, o, "cpu  0 0 0 ");
+    o = append_u64(buf, cap, o, ticks * ncpu); // aggregate idle = sum over cpus
+    o = append(buf, cap, o, " 0 0 0 0 0 0\n");
+    for (uint32_t i = 0; i < ncpu; ++i) {
+        o = append(buf, cap, o, "cpu");
+        o = append_u64(buf, cap, o, i);
+        o = append(buf, cap, o, " 0 0 0 ");
+        o = append_u64(buf, cap, o, ticks);
+        o = append(buf, cap, o, " 0 0 0 0 0 0\n");
+    }
+    o = append(buf, cap, o, "intr ");
+    o = append_u64(buf, cap, o, ticks);
+    o = append(buf, cap, o, "\nctxt ");
+    o = append_u64(buf, cap, o, ticks);
+    o = append(buf, cap, o, "\nbtime ");
+    o = append_u64(buf, cap, o, btime);
+    o = append(buf, cap, o, "\nprocesses ");
+    o = append_u64(buf, cap, o, ncpu + 2);
+    o = append(buf, cap, o, "\nprocs_running 1\nprocs_blocked 0\n");
+    return o;
+}
+
+// /proc/loadavg -- uptime, top, and many health checks read this. Index doesn't
+// compute true load averages, so report 0.00 (idle) with a plausible task count.
+uint32_t gen_loadavg(char *buf, uint32_t cap) {
+    uint32_t o = 0;
+    o = append(buf, cap, o, "0.00 0.00 0.00 1/");
+    o = append_u64(buf, cap, o, misaka_network_online_cpus() + 1);
+    o = append(buf, cap, o, " 2\n"); // running/total and a placeholder last-pid
+    return o;
+}
+
 // Self generators delegate to the pid generators with the running Esper.
 Esper *self_esper() {
     const int idx = esper_running_index();
@@ -385,6 +447,9 @@ const Entry kEntries[] = {
     {"/proc/cmdline",    false, gen_cmdline},
     {"/proc/hostname",   false, gen_hostname},
     {"/proc/kmsg",       false, gen_kmsg},
+    {"/proc/interrupts", false, gen_interrupts},
+    {"/proc/stat",       false, gen_stat},
+    {"/proc/loadavg",    false, gen_loadavg},
     {"/proc/mounts",     false, gen_mounts},
     {"/proc/self",       true,  nullptr},
     {"/proc/self/status", false, gen_self_status},

@@ -1114,7 +1114,15 @@ static uint32_t linux_fd_revents(Esper *me, int fd) {
     case FdKind::pipe_read:  return aiwass_readable(me->fds[fd].pipe_idx) ? 0x1u : 0u;
     case FdKind::pipe_write: return aiwass_writable(me->fds[fd].pipe_idx) ? 0x4u : 0u;
     case FdKind::console:
-    case FdKind::devtty:     return 0x5; // tty read() does its own park
+    case FdKind::devtty:
+        // POLLOUT always writable; POLLIN only when a byte is actually waiting.
+        // Returning 0x5 (always POLLIN-ready) made ppoll(stdin, POLLIN) report
+        // ready every iteration -- busybox ash in SCRIPT mode ppoll's fd 0 and
+        // busy-looped forever (`sh file.sh` / `#!/bin/sh` hung at 100% CPU, never
+        // running the script). has_input() is a non-destructive PL011 FIFO peek;
+        // with no byte we report not-readable so ppoll parks (100 Hz network_tick
+        // re-scans + wakes PollWait), and the parked reader drains via try_read.
+        return 0x4u | (imaginary_number_district::has_input() ? 0x1u : 0u);
     case FdKind::pty_master: return sr_poll_master(me->fds[fd].sock_idx);
     case FdKind::pty_slave:  return sr_poll_slave(me->fds[fd].sock_idx);
     case FdKind::closed:     return 0x20;
@@ -2180,6 +2188,19 @@ void linux_syscall_dispatch(uint64_t *frame) {
         return;
     }
 
+    case 291 /*statx*/:
+        // statx: the JDK's NIO prefers it but falls back to newfstatat(79) on
+        // -ENOSYS -- and javac works fine via that fallback (verified end-to-end:
+        // the triple-indirect build below compiled + ran a class). A full statx
+        // that returned SUCCESS changed the JDK's file-attribute path and
+        // *deterministically* tripped a separate crash in the EL0 context-restore
+        // (FAR=user garbage), so we deliberately stay on the proven fallback and
+        // answer -ENOSYS *quietly*: the explicit case suppresses the per-call
+        // unknown-syscall console spam javac produced by the hundred. Mirrors a
+        // kernel built without statx; revisit a real impl with careful debugging.
+        frame[0] = static_cast<uint64_t>(-38); // -ENOSYS
+        return;
+
     // ---- process / thread identity & signals (mostly no-ops) ----------
     case 96 /*set_tid_address*/:
         // Store the clear_child_tid pointer; the kernel zeroes + futex-wakes it
@@ -2850,7 +2871,17 @@ void linux_syscall_dispatch(uint64_t *frame) {
                 return;
             }
         }
-        frame[0] = 0; // F_GETFL/F_SETFL/F_DUPFD/... : legacy silent success
+        if (cmd == 0 /*F_DUPFD*/ || cmd == 1030 /*F_DUPFD_CLOEXEC*/) {
+            // Real dup to the lowest free fd >= arg. The old stub returned 0,
+            // which made busybox ash (which relocates its script fd to a high
+            // number via F_DUPFD, then closes the original) read its script from
+            // fd 0 = the console -> interactive ppoll loop -> `sh file.sh` hung.
+            const int nfd = linux_dup_fd_from(me, static_cast<int>(fd), static_cast<int>(arg));
+            if (nfd >= 0) me->fds[nfd].cloexec = (cmd == 1030);
+            frame[0] = static_cast<uint64_t>(nfd);
+            return;
+        }
+        frame[0] = 0; // F_GETFL/F_SETFL/... : legacy silent success
         return;
     }
     case 261 /*prlimit64*/: {

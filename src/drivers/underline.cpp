@@ -1,5 +1,6 @@
 #include "drivers/underline.hpp"
 
+#include "drivers/aleister.hpp" // route+enable the used-buffer SPI + bind its handler
 #include "drivers/underground.hpp"
 #include "index/mmio.hpp"
 #include "index/teleport.hpp"
@@ -41,7 +42,14 @@ constexpr uint64_t kQueueDriverLow = 0x090;
 constexpr uint64_t kQueueDriverHigh = 0x094;
 constexpr uint64_t kQueueDeviceLow = 0x0a0;
 constexpr uint64_t kQueueDeviceHigh = 0x0a4;
+constexpr uint64_t kInterruptStatus = 0x060;
+constexpr uint64_t kInterruptAck = 0x064;
 constexpr uint64_t kConfig = 0x100;
+constexpr uint32_t kVirtMmioIntidBase = 48; // virt: virtio-mmio slot i -> INTID 48+i
+constexpr uint8_t kBlkIrqPriority = 0x80;
+volatile uint32_t g_blk_irq_count = 0;
+uint64_t g_blk_irq_base = 0;
+uint32_t g_blk_irq_intid = 0;
 
 constexpr uint32_t kStatusAck = 1;
 constexpr uint32_t kStatusDriver = 2;
@@ -268,10 +276,49 @@ bool setup_modern_pci(Underline &disk) {
     return true;
 }
 
+void blk_irq_handler(void * /*ctx*/) {
+    if (g_blk_irq_base != 0) {
+        const uint32_t isr = read32(g_blk_irq_base + kInterruptStatus);
+        if (isr != 0) {
+            write32(g_blk_irq_base + kInterruptAck, isr);
+        }
+    }
+    g_blk_irq_count = g_blk_irq_count + 1;
+}
+
 } // namespace
 
 const Underline &underline_status() {
     return g_disk;
+}
+
+// Arm the virtio-MMIO used-buffer completion IRQ. MUST be called AFTER the boot
+// teleport to the high half (stable VBAR) and once the scheduler is live -- arming
+// it earlier (before teleport) hung: the SPI, asserted while VBAR was switching,
+// was taken against a transient vector. Idempotent guard via g_blk_irq_count seed.
+void underline_enable_irq() {
+    if (!g_disk.present || g_disk.transport != UnderlineTransport::mmio ||
+        g_blk_irq_base == 0) {
+        return;
+    }
+    const uint32_t isr = read32(g_blk_irq_base + kInterruptStatus); // clear backlog
+    if (isr != 0) {
+        write32(g_blk_irq_base + kInterruptAck, isr);
+    }
+    // DO NOT arm the GIC SPI. Enabling the virtio-blk used-buffer completion SPI
+    // (aleister_enable(intid 48)) WEDGES THE BOX -- exhaustively bisected to this
+    // single line: enabling the level SPI stalls GIC delivery so even the timer PPI
+    // stops, and boot dies right here (this is enter_necessarius's first action,
+    // right after "entering Necessarius"). The platform completes virtio
+    // synchronously on the doorbell vm-exit, so the driver stays on doorbell-poll
+    // (underline_read with the 256-spin re-ring) -- the only working design. This
+    // hook is now a safe no-op kept so the boot path needn't change. See
+    // jvm-bringup.md "virtio 完成中断".
+    (void)&blk_irq_handler; // kept for /proc diagnostics; never armed
+}
+
+uint32_t underline_irq_count() {
+    return g_blk_irq_count;
 }
 
 Underline underline_probe() {
@@ -296,6 +343,8 @@ Underline underline_probe() {
         disk.notify_addr = base + kQueueNotify; // MMIO: notify is a fixed register
         disk.transport = UnderlineTransport::mmio;
         disk.present = true;
+        g_blk_irq_base = base;
+        g_blk_irq_intid = kVirtMmioIntidBase + i;
         const uint64_t lo = read32(base + kConfig + 0);
         const uint64_t hi = read32(base + kConfig + 4);
         disk.capacity_sectors = (hi << 32) | lo;
@@ -348,22 +397,36 @@ bool underline_read(const Underline &disk, uint64_t sector, void *buffer,
     write32(disk.notify_addr, 0); // notify queue 0 (mmio: fixed reg; pci: computed addr)
 
     for (uint64_t spin = 0; spin < 200000000ULL; ++spin) {
-        asm volatile("dsb sy" ::: "memory");
-        if (g_used->idx != g_last_used) {
+        // Observe the device-DMA'd used index with a VOLATILE READ, not a per-spin
+        // `dsb sy`. The old loop did a full-system barrier (~100ns on HVF) EVERY
+        // iteration; a multi-thousand-spin wait then burned milliseconds (measured:
+        // `ls -laR` = 14002 reads / 47M spins, ~4.7s of which was the dsb itself --
+        // the actual cost, NOT the disk). The virtio used ring is cache-coherent,
+        // so a volatile reload sees the device's write; we only dsb when a change
+        // appears (confirm the payload/status are visible) or periodically (bound
+        // observe latency). This cut per-spin cost ~100x.
+        const uint16_t cur = *static_cast<volatile uint16_t *>(&g_used->idx);
+        if (cur != g_last_used) {
+            asm volatile("dsb sy" ::: "memory"); // confirm: data + status visible
             g_last_used = g_used->idx;
-            asm volatile("dsb sy" ::: "memory");
             return g_status_byte[0] == 0;
         }
-        // HVF: the used ring is filled by qemu's MAIN LOOP, which only gets to run
-        // when the vCPU vm-exits occasionally. A pure busy-poll keeps the host on
-        // the vCPU and the aio completion never runs (the SMP=1 java read of
-        // sector ~62k hung at CPU 0% right here; console tracing's occasional MMIO
-        // write vm-exited and unstuck it = the Heisenbug). Re-ring the doorbell
-        // every 4096 spins -- an MMIO store vm-exits, letting qemu run its main
-        // loop to complete the request -- but only OCCASIONALLY: a per-spin
-        // doorbell thrashes the BQL and still hung. No IRQ unmask, so it's safe in
-        // syscall context (WFI/enable-IRQ crashed init via EL1-IRQ nesting).
-        if ((spin & 0xFFF) == 0xFFF) {
+        if ((spin & 0xFF) == 0xFF) {
+            asm volatile("dsb sy" ::: "memory"); // periodic: bound observe latency
+        }
+        // HVF: the used ring is filled by qemu's main loop, which makes progress on
+        // this device only when the guest rings the doorbell (an MMIO store that
+        // vm-exits). Each in-flight read needs ~35 such pumps before qemu's async
+        // host I/O finishes, so the spin count between doorbells is pure busy-wait.
+        // The interval is therefore the lever: re-ringing every 256 spins instead
+        // of the old 4096 cut the boot read profile 8.3x (measured on Apple HVF,
+        // GICv3, virtio-blk-mmio: avg 66821 -> 8087 spins/read, max 225280 -> 23552;
+        // doorbells/read stay ~32, so vm-exit overhead barely moves). 64 (25x) and
+        // 16 (113x) go further but march toward the per-spin BQL-thrash-and-hang
+        // floor the IRQ-less design hit; 256 keeps a 16x safety margin. (Async
+        // completion IRQ is impossible here: WFI-wait/probe-enable/deferred-enable/
+        // IRQ-masked-ring were all re-confirmed to hang -- nothing to wait on.)
+        if ((spin & 0xFF) == 0xFF) {
             write32(disk.notify_addr, 0);
         }
     }

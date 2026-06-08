@@ -100,6 +100,7 @@ int64_t linux_pipe_read(int idx, uint32_t fd, char *buf, uint64_t len,
 // updating pipe refcounts. dup picks the lowest free slot >= 0. dup3 closes
 // any prior occupant of newfd first. Returns the new fd or -errno.
 int linux_dup_fd(Esper *e, int oldfd);
+int linux_dup_fd_from(Esper *e, int oldfd, int minfd); // F_DUPFD: lowest free fd >= minfd
 int linux_dup3_fd(Esper *e, int oldfd, int newfd, uint64_t flags);
 
 // Backend refcount helpers for an *individual* Fd value (not tied to an fd

@@ -77,16 +77,45 @@ const drivers::Underline &disk() { return drivers::underline_status(); }
 
 // Read a whole filesystem block into `dst`.
 bool read_block(uint32_t block, uint8_t *dst) {
+    static uint32_t g_ra_last = 0xFFFFFFFFu; // last block requested (seq detection)
     const uint32_t bs = g_sb.block_size;
     const uint32_t idx = block % kBlkCacheN;
     if (g_bc_meta[idx].valid && g_bc_meta[idx].block == block) {
         bc_copy(dst, g_bc_data[idx], bs); // hit: skip the virtio-blk spin-poll
+        g_ra_last = block;                // track for sequential detection
         return true;
     }
     const uint32_t spb = bs / kSector;
-    // ONE multi-sector virtio request for the whole block. Was spb per-sector
-    // requests (spb busy-polls per block; 8x for a 4 KB block) -- the dominant
-    // cost of java startup. dst is a kernel static block buffer (contiguous).
+    // ADAPTIVE READ-AHEAD: only prefetch when access is SEQUENTIAL (this block
+    // immediately follows the previous read_block). ls -laR / find do RANDOM meta
+    // access (inode + dir blocks scattered); blind read-ahead there fetches 8x and
+    // wastes 7/8, making ls SLOWER (measured 3s->5s). Sequential streams (class/jar
+    // /file data) get one main-loop round-trip serving many blocks instead of the
+    // ~300us virtio-blk busy-poll per block (no completion IRQ). Mirrors Linux's
+    // sequential-detection readahead. Staging is static -- FsGuard serializes ext2.
+    const bool sequential = (block == g_ra_last + 1);
+    g_ra_last = block;
+    if (sequential) {
+        constexpr uint32_t kReadAhead = 8; // 8 * 4 KB = 32 KB window
+        static uint8_t g_ra[kReadAhead * kMaxBlock];
+        uint32_t n = kReadAhead;
+        if (block + n > g_sb.block_count)
+            n = (block < g_sb.block_count) ? (g_sb.block_count - block) : 1;
+        if (n > 1 &&
+            drivers::underline_read(disk(), static_cast<uint64_t>(block) * spb, g_ra, n * bs)) {
+            for (uint32_t k = 0; k < n; ++k) {
+                const uint32_t b = block + k;
+                const uint32_t i = b % kBlkCacheN;
+                bc_copy(g_bc_data[i], g_ra + k * bs, bs);
+                g_bc_meta[i].block = b;
+                g_bc_meta[i].valid = true;
+            }
+            g_ra_last = block + n - 1; // extend the run to the window end
+            bc_copy(dst, g_ra, bs);    // requested block is first in the window
+            return true;
+        }
+    }
+    // Single-block read (random access, or read-ahead skipped/failed).
     if (!drivers::underline_read(disk(), static_cast<uint64_t>(block) * spb, dst, bs)) {
         return false;
     }
@@ -161,7 +190,23 @@ uint32_t map_block(uint32_t lbn) {
         if (mid == 0 || !read_block(mid, g_ind)) return 0;
         return rd32(&g_ind[(lbn % per) * 4]);
     }
-    return 0; // triple-indirect not supported
+    lbn -= per * per;
+    if (lbn < per * per * per) {
+        // Triple-indirect (i_block[14]). Required for files past the double-
+        // indirect limit (= per*per blocks): at 1 KiB blocks that's only 64 MiB,
+        // so the JDK's 143 MiB lib/modules jimage spills here -- without this the
+        // high pages read as zeros and javac dies with "magic value 0". Three
+        // sequential block reads; g_ind2 holds the top then the mid level (the
+        // top pointer is extracted before it is overwritten), g_ind the leaf.
+        const uint32_t tind = rd32(&iblock[14 * 4]);
+        if (tind == 0 || !read_block(tind, g_ind2)) return 0;
+        const uint32_t dind = rd32(&g_ind2[(lbn / (per * per)) * 4]);
+        if (dind == 0 || !read_block(dind, g_ind2)) return 0;
+        const uint32_t mid = rd32(&g_ind2[((lbn / per) % per) * 4]);
+        if (mid == 0 || !read_block(mid, g_ind)) return 0;
+        return rd32(&g_ind[(lbn % per) * 4]);
+    }
+    return 0; // beyond triple-indirect (>16 GiB at 1 KiB blocks) -- unreachable
 }
 
 uint16_t inode_mode() { return rd16(&g_inode[0]); }
@@ -230,6 +275,40 @@ uint32_t dir_lookup(const char *name) {
     return 0;
 }
 
+// [DENTRY CACHE] Resolved abs-path -> inode. ls -laR / find stat thousands of
+// files; without this EVERY stat re-walks the full path from root
+// (resolve_from(2,...)), re-running dir_lookup for /usr, /usr/lib, ... each time
+// = O(files x depth x dir_entries) of pure CPU (`ls -laR /usr/lib/jvm` measured
+// 5s, ALL path resolution -- the block cache already hits, warm was still 5s).
+// Caches path->inode + a parent-dir shortcut: a stat of /d/fileN, when /d is hot,
+// costs ONE dir_lookup instead of re-walking from /. Mirrors Linux's dcache.
+// Wholesale-invalidated on any namespace mutation (create/unlink/rename/mkdir).
+constexpr uint32_t kDentryN = 128;
+struct DentryLine { char path[192]; uint32_t ino; bool valid; };
+DentryLine g_dentry[kDentryN];
+uint32_t g_dentry_clock = 0;
+bool dentry_streq(const char *a, const char *b) {
+    while (*a && *a == *b) { ++a; ++b; }
+    return *a == *b;
+}
+uint32_t dentry_get(const char *path) {
+    for (uint32_t i = 0; i < kDentryN; ++i)
+        if (g_dentry[i].valid && dentry_streq(g_dentry[i].path, path)) return g_dentry[i].ino;
+    return 0;
+}
+void dentry_put(const char *path, uint32_t ino) {
+    uint32_t len = 0;
+    while (path[len] && len < sizeof(g_dentry[0].path) - 1) ++len;
+    if (path[len] != 0) return; // too long to cache
+    const uint32_t idx = (g_dentry_clock++) % kDentryN; // round-robin eviction
+    for (uint32_t i = 0; i <= len; ++i) g_dentry[idx].path[i] = path[i];
+    g_dentry[idx].ino = ino;
+    g_dentry[idx].valid = true;
+}
+void dentry_invalidate_all() {
+    for (uint32_t i = 0; i < kDentryN; ++i) g_dentry[i].valid = false;
+}
+
 // Resolve an absolute (or root-relative) path to its inode number, starting
 // from `start_ino`. Leaves g_inode holding the resolved inode on success.
 // Follows up to ~8 symlinks (anti-loop). If `nofollow_last` is true the final
@@ -283,9 +362,40 @@ uint32_t resolve_from(uint32_t start_ino, const char *path, uint32_t depth,
     return parent;
 }
 
-// Public-style entry: absolute paths only (the wrapper expectation).
+// Public-style entry: absolute paths only (the wrapper expectation). Uses the
+// dentry cache: exact-hit returns immediately; else a parent-dir shortcut
+// resolves just the leaf when the parent is hot; else a full walk from root (and
+// caches the result). Every return path read_inode()s the inode it returns so
+// g_inode is left correct (callers rely on it).
 uint32_t resolve(const char *path) {
-    return resolve_from(2, path, 0, false);
+    const uint32_t hit = dentry_get(path);
+    if (hit != 0 && read_inode(hit)) return hit; // exact hit
+    // Parent-dir shortcut: split into parent + leaf; if the parent is cached,
+    // resolve the leaf with a single dir_lookup instead of re-walking from root.
+    int32_t slash = -1;
+    for (uint32_t i = 0; path[i]; ++i) if (path[i] == '/') slash = static_cast<int32_t>(i);
+    if (slash > 0) {
+        char parentp[192], leaf[64];
+        if (static_cast<uint32_t>(slash) < sizeof(parentp)) {
+            for (int32_t i = 0; i < slash; ++i) parentp[i] = path[i];
+            parentp[slash] = 0;
+            uint32_t ln = 0;
+            for (uint32_t i = static_cast<uint32_t>(slash) + 1; path[i] && ln + 1 < sizeof(leaf); ++i)
+                leaf[ln++] = path[i];
+            leaf[ln] = 0;
+            const uint32_t pino = dentry_get(parentp);
+            if (pino != 0 && ln > 0 && read_inode(pino) && inode_is_dir()) {
+                const uint32_t lino = dir_lookup(leaf);
+                if (lino != 0 && read_inode(lino) && !inode_is_symlink()) {
+                    dentry_put(path, lino);
+                    return lino; // g_inode already on the leaf
+                }
+            }
+        }
+    }
+    const uint32_t ino = resolve_from(2, path, 0, false);
+    if (ino != 0) dentry_put(path, ino);
+    return ino;
 }
 
 } // namespace
@@ -745,6 +855,7 @@ void free_inode_blocks() {
 
 int64_t ext2_write_file(const char *path, const char *buf, uint32_t len) {
     if (!g_sb.mounted) return -1;
+    dentry_invalidate_all(); // path->inode may change (create); keep cache coherent
     uint32_t parent_ino = 0;
     char leaf[64];
     if (!resolve_parent(path, &parent_ino, leaf, sizeof(leaf))) return -1;
@@ -863,6 +974,7 @@ bool ext2_symlink(const char *target, const char *path) {
 
 bool ext2_mkdir(const char *path) {
     if (!g_sb.mounted) return false;
+    dentry_invalidate_all(); // new dir entry; keep dentry cache coherent
     uint32_t parent_ino = 0;
     char leaf[64];
     if (!resolve_parent(path, &parent_ino, leaf, sizeof(leaf))) return false;
@@ -976,6 +1088,7 @@ void free_blocks_range(uint32_t start_lbn, uint32_t end_lbn) {
 
 bool ext2_unlink(const char *path) {
     if (!g_sb.mounted) return false;
+    dentry_invalidate_all(); // path removed (inode freed/reused); must drop cache
     uint32_t parent_ino = 0;
     char leaf[64];
     if (!resolve_parent(path, &parent_ino, leaf, sizeof(leaf))) return false;
@@ -1000,6 +1113,7 @@ bool ext2_unlink(const char *path) {
 
 bool ext2_rename(const char *old_path, const char *new_path) {
     if (!g_sb.mounted) return false;
+    dentry_invalidate_all(); // old path -> inode mapping changes; must drop cache
     // Resolve both parents + leaves.
     uint32_t old_parent = 0, new_parent = 0;
     char old_leaf[64], new_leaf[64];
@@ -1044,6 +1158,7 @@ bool ext2_rename(const char *old_path, const char *new_path) {
 
 bool ext2_truncate(const char *path, uint64_t new_size) {
     if (!g_sb.mounted) return false;
+    dentry_invalidate_all(); // conservative: size/blocks change under the path
     const uint32_t ino = resolve(path);
     if (ino == 0) return false;
     if (inode_is_dir()) return false;
