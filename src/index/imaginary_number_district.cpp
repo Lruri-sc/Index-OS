@@ -12,6 +12,15 @@ namespace {
 
 drivers::ElectroMaster g_line;
 bool g_ready = false;
+// Once the RX IRQ is armed, the IRQ handler is the SOLE consumer of the PL011
+// hardware RX FIFO -- it drains every byte into g_input_ring. The read path must
+// then read ONLY from the ring; if try_read also popped the hardware FIFO (the
+// pre-IRQ boot fallback below) it would be a second concurrent consumer of the
+// same FIFO, racing the IRQ across cores and duplicating/dropping bytes (seen as
+// scrambled keystrokes under SMP). This flag gates the direct-FIFO fallback off
+// the moment the IRQ owns the FIFO. (Linux likewise: once the UART is in
+// interrupt mode, the ISR is the only thing that touches the RX register.)
+bool g_rx_irq_on = false;
 uint32_t g_fg_pgrp = 0; // 0 = none (job control off / pre-tcsetpgrp)
 bool g_isig = true;     // matches default termios (ISIG on)
 char g_vintr = 3;       // Ctrl-C
@@ -164,16 +173,27 @@ namespace {
 //   2. PL011's RX FIFO is only 32 bytes; under heavy paste the IRQ can drain
 //      it into a bigger software buffer the userland reader can take its time
 //      with.
-// Single producer (PL011 IRQ on boot core) + single consumer (EL0 scheduler
-// is single-core today), so no lock needed. If/when EL0 goes multi-core, wrap
-// the pop in a CAS.
+// Producer = the PL011 RX IRQ (routed to the boot core); consumer = the read()
+// syscall, which since the EL0-SMP migration runs on ANY core. That makes this a
+// genuine cross-core producer/consumer: g_input_size is incremented by push and
+// decremented by pop from different cores (a non-atomic read-modify-write on
+// both sides = a lost-update race), and ring slots written on the boot core are
+// read on another with no barrier. A short irqsave spinlock serialises push/pop
+// -- the natural granularity for one shared device, and irqsave so the RX IRQ
+// can never deadlock against a consumer holding the lock on the same core. (The
+// lock is a leaf: push/pop never call out while holding it, so it never nests
+// with g_esper_lock -- the IRQ's SIGINT/ipc_wake happen outside input_push.)
+// Before this, burst input raced and bytes were dropped/reordered: a quickly
+// typed command could arrive scrambled (e.g. "stress.sh" -> "strress.hs").
 constexpr uint32_t kInputRingSize = 256;
 char g_input_ring[kInputRingSize];
 uint32_t g_input_head = 0;
 uint32_t g_input_tail = 0;
 uint32_t g_input_size = 0;
+AntiSkill g_input_lock;
 
 void input_push(char c) {
+    const uint64_t f = anti_skill_lock_irqsave(g_input_lock);
     if (g_input_size >= kInputRingSize) {
         // Drop oldest -- the alternative is dropping the new byte, but losing
         // the most recent keystroke is more confusing for an interactive user.
@@ -183,13 +203,19 @@ void input_push(char c) {
     g_input_ring[g_input_head] = c;
     g_input_head = (g_input_head + 1) % kInputRingSize;
     ++g_input_size;
+    anti_skill_unlock_irqrestore(g_input_lock, f);
 }
 
 int input_pop() {
-    if (g_input_size == 0) return -1;
+    const uint64_t f = anti_skill_lock_irqsave(g_input_lock);
+    if (g_input_size == 0) {
+        anti_skill_unlock_irqrestore(g_input_lock, f);
+        return -1;
+    }
     const char c = g_input_ring[g_input_tail];
     g_input_tail = (g_input_tail + 1) % kInputRingSize;
     --g_input_size;
+    anti_skill_unlock_irqrestore(g_input_lock, f);
     return static_cast<int>(static_cast<uint8_t>(c));
 }
 
@@ -199,11 +225,14 @@ int try_read() {
     if (!g_ready) {
         return -1;
     }
-    // Ring first; only fall back to a direct PL011 read if the ring is empty
-    // AND no IRQ has fired yet (pre-enable_rx_irq boot path -- read_blocking
-    // pre-init).
+    // Ring first. The direct-PL011 fallback is ONLY for the pre-IRQ boot path
+    // (read_blocking before enable_rx_irq). Once the IRQ owns the FIFO, never
+    // touch the hardware register here -- doing so would race the IRQ's drain
+    // across cores (the dual-consumer bug). Empty ring + IRQ on == genuinely no
+    // data: return -1 so the caller parks and the IRQ wakes it after input_push.
     const int from_ring = input_pop();
     if (from_ring >= 0) return from_ring;
+    if (g_rx_irq_on) return -1;
     return drivers::electro_master_try_read(g_line);
 }
 
@@ -211,7 +240,13 @@ bool has_input() {
     if (!g_ready) {
         return false;
     }
-    if (g_input_size > 0) return true;
+    const uint64_t f = anti_skill_lock_irqsave(g_input_lock);
+    const bool nonempty = g_input_size > 0;
+    anti_skill_unlock_irqrestore(g_input_lock, f);
+    if (nonempty) return true;
+    // After the IRQ owns the FIFO, the ring is authoritative: don't peek the
+    // hardware (a byte sitting in the FIFO is drained + wakes us via the IRQ).
+    if (g_rx_irq_on) return false;
     return drivers::electro_master_has_input(g_line);
 }
 
@@ -251,9 +286,18 @@ void pl011_rx_irq(void *) {
 
 void enable_rx_irq() {
     if (!g_ready) return;
+    // Drain any byte already sitting in the FIFO into the ring BEFORE handing the
+    // FIFO to the IRQ, so nothing typed during the boot->IRQ handover is stranded
+    // (after g_rx_irq_on flips, try_read won't touch the hardware FIFO anymore).
+    for (;;) {
+        const int ch = drivers::electro_master_try_read(g_line);
+        if (ch < 0) break;
+        input_push(static_cast<char>(ch));
+    }
     drivers::electro_master_enable_rx_irq(g_line);
     drivers::aleister_register(kUartIntId, pl011_rx_irq, nullptr);
     drivers::aleister_enable(kUartIntId, 0x80);
+    g_rx_irq_on = true; // from here the IRQ is the sole hardware-FIFO consumer
 }
 
 void set_fg_pgrp(uint32_t pgrp) { g_fg_pgrp = pgrp; }

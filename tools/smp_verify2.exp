@@ -1,0 +1,74 @@
+#!/usr/bin/expect -f
+# HVF verifier. The busybox line editor emits ESC[6n at each prompt and BLOCKS
+# reading the DSR reply before it will accept typed input. So before every command
+# we wait for the [6n, send a cursor report, THEN type -- otherwise the editor
+# swallows the command while waiting. Verdicts: live + post-hoc grep of the log.
+set HERE "/Users/lruri/Desktop/Index/arm-Index"
+log_file -noappend /tmp/index_smp_verify.log
+set send_slow {1 0.04}
+
+proc cmd {c} {
+    # consume the prompt's cursor-position query and answer it, then type
+    expect { -re {\[6n} {} timeout 5 {} }
+    send "\033\[1;1R"
+    after 120
+    send -s "$c\r"
+}
+
+set timeout 90
+spawn qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu host \
+    -m 4096M -smp 8 -display none -serial stdio -monitor none \
+    -drive file=$HERE/build/ext2-jvm-26.img,if=none,id=hd0,format=raw,cache=directsync \
+    -device virtio-blk-device,drive=hd0 \
+    -kernel $HERE/build/Image
+
+expect { timeout { puts "\n=== VERDICT: NO_LOGIN ==="; exit 2 } -re {login:} {} }
+after 800
+send -s "crowley\r"
+set timeout 12
+expect { -re {(?i)password} {} timeout {} -re {login:} { after 400; send -s "crowley\r"; exp_continue } }
+after 500
+send -s "\r"
+
+# confirm interactive shell (cmd answers [6n so the echo is prompt)
+set timeout 8
+set shell_ok 0
+for {set i 0} {$i < 10} {incr i} {
+    cmd "echo READYOK777"
+    expect { "READYOK777" { set shell_ok 1; break } timeout {} }
+}
+if {$shell_ok == 0} { puts "\n=== VERDICT: NO_SHELL ==="; close; wait; exit 3 }
+puts "\n=== LOGIN OK ==="
+
+# --- PHASE 1: burst input integrity (unique metachar-free markers) ---
+set burst_live 0
+set burst_total 20
+for {set i 0} {$i < $burst_total} {incr i} {
+    set tag "BRST${i}xKQWERTYUIOPASDFGHJKLMNBVCXZabcdefghij0123456789END"
+    cmd "echo $tag"
+    set timeout 6
+    expect { "$tag" { incr burst_live } timeout {} }
+}
+puts "\n=== VERDICT: BURST_LIVE $burst_live / $burst_total ==="
+
+# --- PHASE 2: SMP stress regression ---
+set started 0
+for {set i 0} {$i < 6} {incr i} {
+    cmd "sh /root/stress.sh"
+    set timeout 14
+    expect { "STRESS_START" { set started 1; break } -re {not found|No such} {} timeout {} }
+    if {$started} break
+}
+if {$started == 0} { puts "\n=== VERDICT: STRESS_NOT_STARTED ==="; close; wait; exit 4 }
+set timeout 600
+expect {
+    "STRESS_END" { puts "\n=== VERDICT: STRESS_SURVIVED ===" }
+    -re {EL0 FAULT|EL1 |Unhandled|KERNEL PANIC|\[PANIC|ESR 0x|ESR=0x|L1GUARD|ELRGUARD|FTRAP|KCTX|FLBAD} {
+        puts "\n=== VERDICT: STRESS_FAULT ==="; set timeout 30; expect { "STRESS_END" {} timeout {} }
+    }
+    timeout { puts "\n=== VERDICT: STRESS_TIMEOUT ===" }
+}
+send -s "\r"
+close
+wait
+exit 0

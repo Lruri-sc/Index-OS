@@ -1,0 +1,94 @@
+#!/usr/bin/expect -f
+# Drive a faithful HVF run (Apple hypervisor + real GICv3 + SMP=8, 4 GiB to match
+# the deployed UTM machine), log in as crowley (uid 0, empty password), run the
+# SMP stress script, and capture the whole serial transcript for offline analysis.
+# HVF is Index's ground truth: any EL0/EL1 fault here is a real bug (TCG wild-jumps
+# don't reproduce under HVF). Self-terminates on STRESS_END, a fault, or timeout.
+#
+# Burst serial input gets byte-reordered by the guest console RX path, so EVERY
+# keystroke is slow-sent (send -s) and every command is confirmed by a marker we
+# re-send until it lands. That keeps the harness from mistaking a mangled command
+# (e.g. stress.sh -> strress.hs) for a kernel hang.
+set HERE  "/Users/lruri/Desktop/Index/arm-Index"
+set LOG   "/tmp/index_smp_stress.log"
+set SMP   8
+log_file -noappend $LOG
+set send_slow {1 0.06}
+
+set timeout 90
+spawn qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu host \
+    -m 4096M -smp $SMP -display none -serial stdio -monitor none \
+    -drive file=$HERE/build/ext2-jvm-26.img,if=none,id=hd0,format=raw,cache=directsync \
+    -device virtio-blk-device,drive=hd0 \
+    -kernel $HERE/build/Image
+
+# --- boot to login ---
+expect {
+    timeout { puts "\n=== VERDICT: NO_LOGIN (boot hung/failed) ==="; exit 2 }
+    -re {login:} {}
+}
+after 1000
+send -s "crowley\r"
+set timeout 15
+expect { -re {(?i)password} {} timeout {} -re {login:} { after 500; send -s "crowley\r"; exp_continue } }
+after 500
+send -s "\r"
+
+# confirm an interactive shell evaluates a computed marker (output "IDX_SHELL=42",
+# not the echoed command); retry, re-logging-in if a fresh login: reappears.
+set timeout 6
+set shell_ok 0
+for {set i 0} {$i < 12} {incr i} {
+    send -s "echo IDX_SHELL=\$((6*7))\r"
+    expect {
+        "IDX_SHELL=42" { set shell_ok 1; break }
+        -re {(?i)password} { after 300; send -s "\r" }
+        -re {login:}       { after 400; send -s "crowley\r"; after 600 }
+        timeout {}
+    }
+}
+if {$shell_ok == 0} { puts "\n=== VERDICT: NO_SHELL ==="; close; wait; exit 3 }
+puts "\n=== LOGIN OK ==="
+
+# --- launch the stress; confirm STRESS_START actually printed (command landed) ---
+set timeout 12
+set started 0
+for {set i 0} {$i < 6} {incr i} {
+    send -s "\x15";             # Ctrl-U: clear any partial/mangled line
+    send -s "sh /root/stress.sh\r"
+    expect {
+        "STRESS_START" { set started 1; break }
+        -re {not found|can't open|No such file} { }
+        timeout {}
+    }
+    if {$started} break
+}
+if {$started == 0} { puts "\n=== VERDICT: STRESS_NOT_STARTED (command kept mangling) ==="; close; wait; exit 4 }
+puts "=== STRESS_START seen ==="
+
+# --- watch for STRESS_END or any fault signature live ---
+set timeout 600
+expect {
+    "STRESS_END" { puts "\n=== VERDICT: SURVIVED (STRESS_END) ===" }
+    -re {EL0 FAULT|EL1 |Unhandled|KERNEL PANIC|\[PANIC|ESR 0x|ESR=0x|L1GUARD|ELRGUARD|FTRAP|KCTX|FLBAD} {
+        puts "\n=== VERDICT: FAULT_SIGNATURE_SEEN ==="
+        set timeout 30
+        expect { "STRESS_END" {} timeout {} }
+    }
+    timeout { puts "\n=== VERDICT: STRESS_TIMEOUT (possible hang) ===" }
+}
+
+# --- confirm the shell still works after the storm ---
+set timeout 20
+set alive 0
+for {set i 0} {$i < 6} {incr i} {
+    send -s "echo POST=\$((20+22))\r"
+    expect { "POST=42" { set alive 1; break } timeout {} }
+    if {$alive} break
+}
+if {$alive} { puts "=== POST: SHELL_ALIVE ===" } else { puts "=== POST: SHELL_DEAD_OR_HUNG ===" }
+
+send -s "\r"
+close
+wait
+exit 0

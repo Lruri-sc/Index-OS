@@ -1,0 +1,35 @@
+#!/usr/bin/expect -f
+set HERE "/Users/lruri/Desktop/Index/arm-Index"
+log_file -noappend /tmp/diag.log
+set send_slow {1 0.06}
+set timeout 90
+spawn qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu host \
+    -m 4096M -smp 8 -display none -serial stdio -monitor none \
+    -drive file=$HERE/build/ext2-jvm-26.img,if=none,id=hd0,format=raw,cache=directsync \
+    -device virtio-blk-device,drive=hd0 \
+    -kernel $HERE/build/Image
+expect { timeout {puts "NO_LOGIN"; exit 2} -re {login:} {} }
+after 1000
+send -s "crowley\r"
+set timeout 8
+expect { -re {(?i)password} {} timeout {} }
+after 800
+send -s "\r"
+after 2500
+puts "\n>>> sending marker (plain send) <<<"
+send "echo ZQXJ123MARKER\r"
+set timeout 12
+exp_internal 1
+expect {
+    "ZQXJ123MARKER" { exp_internal 0; puts "\n>>> GLOB MATCHED <<<" }
+    timeout { exp_internal 0; puts "\n>>> GLOB TIMEOUT NO MATCH <<<" }
+}
+# second try: regex
+puts "\n>>> retry regex <<<"
+send "echo ZQXJ456RX\r"
+set timeout 12
+expect {
+    -re {ZQXJ456RX} { puts "\n>>> REGEX MATCHED <<<" }
+    timeout { puts "\n>>> REGEX TIMEOUT NO MATCH <<<" }
+}
+close; wait; exit 0

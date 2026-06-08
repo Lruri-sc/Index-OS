@@ -1,0 +1,45 @@
+#!/usr/bin/expect -f
+# Robust HVF verifier that does NOT rely on expect's live output matching (which
+# has proven flaky against the busybox line-editor's ESC[6n stream). It anchors
+# only on the one reliable token ("login:"), then drives purely by timing and
+# dumps the full serial transcript to a log. ALL verdicts are computed post-hoc
+# by grepping that log:
+#   - burst-input integrity (25 unique metachar-free markers, fast-sent)
+#   - SMP stress survival (STRESS_START / STRESS round= / STRESS_END)
+#   - no fault signatures
+#   - shell still alive afterwards (a post-stress token)
+set HERE "/Users/lruri/Desktop/Index/arm-Index"
+log_file -noappend /tmp/index_smp_drive.log
+set send_slow {1 0.05}
+
+set timeout 90
+spawn qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu host \
+    -m 4096M -smp 8 -display none -serial stdio -monitor none \
+    -drive file=$HERE/build/ext2-jvm-26.img,if=none,id=hd0,format=raw,cache=directsync \
+    -device virtio-blk-device,drive=hd0 \
+    -kernel $HERE/build/Image
+
+expect { timeout { puts "NO_LOGIN"; exit 2 } -re {login:} {} }
+after 1500
+send -s "crowley\r"
+after 2500
+send -s "\r"
+after 4000
+
+# PHASE 1: fast-burst input integrity (timed; judged post-hoc)
+for {set i 0} {$i < 25} {incr i} {
+    send "echo BRST${i}xKQWERTYUIOPASDFGHJKLMNBVCXZabcdefghij0123456789END\r"
+    after 250
+}
+after 1500
+
+# PHASE 2: SMP stress (timed; judged post-hoc). Give 6 rounds plenty of time.
+send -s "sh /root/stress.sh\r"
+after 170000
+send -s "\r"
+after 1000
+send -s "echo POSTSTRESS_ALIVE_2468\r"
+after 3000
+close
+wait
+exit 0

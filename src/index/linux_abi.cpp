@@ -2831,11 +2831,12 @@ void linux_syscall_dispatch(uint64_t *frame) {
         if (!ensure_user(me, va, 6 * 65)) { frame[0] = static_cast<uint64_t>(-14); return; }
         char *u = reinterpret_cast<char *>(va);
         for (uint32_t i = 0; i < 6 * 65; ++i) u[i] = 0;
-        // sysname MUST be "Linux" for Linux-ABI binaries: the JDK's
-        // sun.nio.fs.DefaultFileSystemProvider (and many glibc/musl platform
-        // checks) switch on os.name (== uname.sysname) and throw "Platform not
-        // recognized" for anything else -- "Index" broke java's nio init. Index
-        // identity is kept in nodename ("index") and release ("5.0.0-Index").
+        // This is the LINUX-ABI uname; anything that reaches it is a Linux binary,
+        // and many platform-detect on sysname (JDK os.name, glibc/musl) -- so it
+        // returns "Linux". Index's OWN tools (e.g. /bin/uname) are native-ABI
+        // programs that don't call this and report "Index" themselves. So the
+        // identity splits by ABI, not by a kernel-side guess. nodename + release
+        // ("5.0.0-Index") still carry the Index brand here.
         const char *fields[6] = {"Linux", "index", "5.0.0-Index", "#1", "aarch64", "(none)"};
         for (uint32_t f = 0; f < 6; ++f) {
             const char *s = fields[f];

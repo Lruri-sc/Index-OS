@@ -46,6 +46,12 @@ enter_user:                 // x0 = user entry, x1 = user stack top, x2 = ttbr0
     cmp     x1, x9                    // user SP
     bhs     .Lresume_corrupt
 
+    // Mask IRQs across the EL0-entry install -> eret (same rationale as
+    // resume_user_eret: keep the half-installed return state off the IRQ path so
+    // a residual wild-write can't corrupt an irq_entry-saved frame here). eret
+    // restores SPSR x11=0x340 (IRQ enabled at EL0), so EL0 stays preemptible.
+    msr     daifset, #2               // mask IRQ (I); eret below unmasks via SPSR
+
     msr     ttbr0_el1, x2   // install this process's private address space
     dsb     ish
     tlbi    vmalle1is       // broadcast: a thread can migrate to another CPU
@@ -135,6 +141,18 @@ resume_user_eret:                 // x0=regs, x1=sp_el0, x2=elr, x3=spsr, x4=tpi
     // >= the ceiling (high half); a user-range value is corruption -> divert.
     cmp     x0, x9                    // regs ptr must be a kernel addr (>= ceiling)
     blo     .Lresume_corrupt
+
+    // Mask IRQs across the EL0-context restore -> eret. With IRQs enabled here a
+    // timer IRQ saves x0..x30 onto the kernel stack (irq_entry); the residual
+    // cross-core wild-write then corrupting the saved regs-ptr (x0) makes the
+    // eret resume with x0=0 -> `ldr x1,[x0,#8]` faults at FAR=0x8 (observed on
+    // HVF: this exact crash). With IRQs masked, no IRQ fires in this window, so
+    // x0 stays register-resident and is unreachable by a memory wild-write. The
+    // eret restores the user's SPSR (IRQ enabled at EL0), so EL0 stays
+    // preemptible -- this is exactly how mainstream return-to-user masks IRQs
+    // across the final context switch. Placed AFTER the guard so the corrupt
+    // divert (.Lresume_corrupt) keeps the caller's DAIF unchanged.
+    msr     daifset, #2               // mask IRQ (I); eret below unmasks via SPSR
 
     msr     sp_el0, x1
     msr     elr_el1, x2

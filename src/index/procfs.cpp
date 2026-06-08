@@ -149,9 +149,13 @@ uint32_t gen_uptime(char *buf, uint32_t cap) {
 }
 
 uint32_t gen_version(char *buf, uint32_t cap) {
+    // The "Linux version " prefix + numeric "5.0.0" are the ABI-detection surface
+    // (uname -a parsers, glibc/musl/JDK kernel-version checks) -- keep them. The
+    // "-Index" release suffix + "Index" builder are pure branding (like a distro's
+    // "-generic"/"-arch" suffix), visible to humans but ignored by detection.
     return append(buf, cap, 0,
-        "Linux version 5.0.0-arm-Index (crowley@academy-city) "
-        "(arm-Index synth) #1 SMP\n");
+        "Linux version 5.0.0-Index (crowley@index) "
+        "(Index C++ kernel) #1 SMP\n");
 }
 
 uint32_t gen_cmdline(char *buf, uint32_t cap) {

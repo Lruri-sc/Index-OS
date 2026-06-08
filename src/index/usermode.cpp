@@ -1441,6 +1441,19 @@ bool linux_execve_replace(int idx, const char *path, const char *const *user_arg
     // linux_build_startup_stack consumed exec_argv/exec_envp (cleared counts),
     // so the staging strings are no longer needed.
     dark_matter_free(stage);
+    // execve sets comm = basename(program) (Linux task->comm): so ps / diagnostics
+    // and the per-program uname identity (case 160) see "java", not the forking
+    // shell's inherited name. real_path is the actual binary loaded (= the
+    // interpreter for a #! script). Clone(CLONE_VM) threads inherit this name.
+    {
+        const char *b = real_path;
+        for (const char *p = real_path; *p; ++p) {
+            if (*p == '/') b = p + 1;
+        }
+        uint32_t n = 0;
+        for (; b[n] != 0 && n + 1 < sizeof(e->name); ++n) e->name[n] = b[n];
+        e->name[n] = 0;
+    }
     // POSIX close-on-exec: now that exec has succeeded, drop every fd marked
     // O_CLOEXEC/FD_CLOEXEC. sshd marks its listener/monitor/pty fds CLOEXEC;
     // without this they leak across the re-exec chain, pinning the pty
@@ -1870,8 +1883,29 @@ static_assert(sizeof(reinterpret_cast<Esper*>(0)->regs) == 31 * 8,
 // (x0..x30, ELR at [32], SPSR at [33]) plus the live SP_EL0. Swap it (and the
 // address space) for the next ready Esper so the pending eret resumes it.
 void esper_preempt(uint64_t *frame) {
+    // Only preempt+save when this timer IRQ interrupted genuine EL0 user code.
+    // We read the interrupted SPSR_EL1 mode bits (frame[kFrameSpsr], saved by
+    // irq_entry): EL0t (==0) -> a user process; anything else -> kernel, skip.
+    //
+    // ★INVARIANT this trusts (root cause of the 2026-06-08 "resume_user_eret
+    // x0=0 / 内核野写" HVF crash): frame[kFrameSpsr] is a RELIABLE EL0/EL1
+    // discriminator ONLY because every kernel path that installs a *user*
+    // SPSR_EL1 before its eret runs with IRQs masked -- so a timer IRQ can never
+    // observe SPSR_EL1=EL0t while the CPU is actually still at EL1. The two paths
+    // driven by the IRQ-ENABLED scheduler loop, resume_user_eret + enter_user,
+    // mask IRQs across their install->eret window precisely for this (msr
+    // daifset,#2 after the guard in user_switch.S; eret unmasks via the user
+    // SPSR). Every other user-SPSR install (load_ctx, linux_deliver_signal,
+    // rt_sigreturn) runs in the synchronous-trap / IRQ-handler path, which is
+    // IRQ-masked end to end (el0_sync_entry never re-enables IRQs). Before the
+    // fix, an IRQ in the resume_user_eret window saw SPSR_EL1=EL0t (already
+    // installed for the upcoming eret) -> this check passed -> esper_preempt
+    // saved the EL1 *kernel* frame as the resuming Esper's user context,
+    // corrupting cur->regs/elr (looked like a random cross-core wild write).
+    // ⚠ If you ever enable IRQs around any user-SPSR install, you MUST mask them
+    // across its install->eret window too, or this check will be fooled again.
     if (((frame[kFrameSpsr] >> 2) & 0x3) != 0) {
-        return; // interrupted the kernel, not a user process
+        return; // interrupted the kernel (EL1), not a user process -- don't save
     }
     const int idx = esper_running_index();
     if (idx < 0) {
