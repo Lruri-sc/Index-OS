@@ -28,6 +28,7 @@ bool ext2_is_dir(const char *path);
 // out's mode/size/uid/gid/atime/mtime/ctime. Returns false if the path
 // doesn't exist.
 bool ext2_stat(const char *path, LateranEntry *out);
+bool ext2_stat_nofollow(const char *path, LateranEntry *out); // lstat semantics
 
 bool ext2_rename(const char *old_path, const char *new_path);
 bool ext2_truncate(const char *path, uint64_t new_size);
@@ -50,6 +51,10 @@ bool ext2_fs_stats(Ext2FsStats *out);
 
 // Write side.
 int64_t ext2_write_file(const char *path, const char *buf, uint32_t len);
+// Incremental write at offset: touches only affected blocks (no whole-file
+// rewrite), allocates via direct/single/double/triple indirect. For large
+// guest writes (apt/dpkg). Returns bytes written or -1.
+int64_t ext2_pwrite(const char *path, uint64_t off, const char *buf, uint32_t len);
 bool ext2_unlink(const char *path);
 bool ext2_mkdir(const char *path);
 

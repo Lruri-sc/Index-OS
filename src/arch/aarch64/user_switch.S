@@ -88,6 +88,7 @@ leave_user:                 // restores the kernel context saved by enter_user
     tlbi    vmalle1is
     dsb     ish
     isb
+    bl      pr2_leave_mm          // clear this CPU's active-mm slot (reality_unref barrier)
     CPU_KCTX_PTR
     ldp     x19, x20, [x9, #0]
     ldp     x21, x22, [x9, #16]

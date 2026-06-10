@@ -54,6 +54,12 @@ bool pr2_add_vma(Esper *e, uint64_t start, uint64_t end, uint8_t prot,
 // false on a miss (real segfault -- terminate the process).
 bool pr2_handle_fault(Esper *e, uint64_t far);
 
+// Record which address space (mm) this CPU's TTBR0 is loaded with right now.
+// load_ctx calls it on every context switch; leave_user clears it (nullptr).
+// reality_unref's teardown spins on these so it never frees page tables a
+// sibling thread is still executing on another core (SMP mm use-after-free).
+void pr2_note_active_mm(PersonalReality *mm);
+
 // Pre-install every page covering [va, va+len). Used by syscall handlers in
 // linux_abi.cpp before they dereference a user buffer, because the kernel's
 // EL1 access would itself trigger an EL1 data abort (EC=0x25) that nobody

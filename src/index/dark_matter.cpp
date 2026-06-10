@@ -12,10 +12,20 @@ namespace {
 // (~600 KiB) + libgcc resident. With multi-core EL0 several heavy C++
 // programs now exec CONCURRENTLY (one per core), so the transient + resident
 // peak scales with core count: 4x mt_cxx at once overran the old 16 MiB
-// ("exec: out of heap"). 64 MiB gives all 8 cores headroom on the 1 GiB
-// machine. (This is a capacity limit, not a leak -- /proc/index_resources
-// shows the heap plateauing once the programs are resident.)
-constexpr uint64_t kArenaSize = 64 * 1024 * 1024;
+// ("exec: out of heap"). (This is a capacity limit, not a leak --
+// /proc/index_resources shows the heap plateauing once programs are resident.)
+//
+// 256 MiB (was 64): the Testament tmpfs stores each file as one contiguous heap
+// block grown by ensure_cap's amortized doubling, so `apt update` against a real
+// mirror -- whose index (Packages ~25 MiB + pkgcache ~25 MiB for jammy main)
+// lands in the tmpfs idxapt mounts over apt's write dirs -- needs ~50-75 MiB
+// plus the doubling's transient 2x peak. The old 64 MiB heap couldn't satisfy
+// the contiguous alloc -> dark_matter_alloc returned null -> the tmpfs write
+// failed -> apt saw "Write error (Operation not permitted)". The page allocator
+// is separate (tree_diagram_alloc_page), so this only grows the kernel heap's
+// BSS, not the user/page pool. (A prior session ran 256 MiB fine, then reverted
+// to 64 once mmap demand-paging made *java* not need it; tmpfs still does.)
+constexpr uint64_t kArenaSize = 256 * 1024 * 1024;
 
 AntiSkill g_lock; // serializes the free list across cores
 

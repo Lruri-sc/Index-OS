@@ -386,7 +386,13 @@ uint32_t do_readdir(uint32_t fid, LateranEntry *out, uint32_t max) {
         uint32_t ro = 7;
         const uint32_t blen = rd32(ro);
         if (blen == 0) break; // EOF
-        const uint32_t end = ro + blen;
+        uint32_t end = ro + blen;
+        // blen is the host-supplied body length; clamp it to the bytes we
+        // actually received (r <= kBufSize) and guard the u32 wrap, or a
+        // malicious/buggy 9p server drives the dirent loop past g_rx[] -> OOB
+        // read (stale BSS leaked into dirent names). Same class as the TCP
+        // ip_total bound in handle_inbound.
+        if (end < ro || end > r) end = r;
         while (ro + 24 <= end && total < max) {
             const uint8_t qtype = g_rx[ro];     // qid.type (bit 7 = dir)
             ro += 13;                            // skip qid (13 bytes)

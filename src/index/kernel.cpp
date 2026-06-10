@@ -356,6 +356,8 @@ extern "C" char __text_end[];
 // (easy to find/copy instead of being buried under recurring [WD] blocks).
 extern "C" volatile bool g_panicked = false;
 
+namespace index { int kernel_stack_canary_check(); } // misaka_network.cpp: crash-time stack-overflow naming
+
 extern "C" void exception_report(uint64_t kind, uint64_t esr, uint64_t elr,
                                   uint64_t far, uint64_t spsr, uint64_t lr,
                                   uint64_t fp, uint64_t sp) {
@@ -379,6 +381,22 @@ extern "C" void exception_report(uint64_t kind, uint64_t esr, uint64_t elr,
     const uint64_t thi = reinterpret_cast<uint64_t>(__text_end);
     district::write("\n  ktext ["); district::hex(tlo);
     district::write(","); district::hex(thi); district::write(")");
+
+    // Name a clobbered kernel-stack canary AT crash time: the periodic cpu-0
+    // STACKGUARD may not have run before this fault, and an ELR=0 / zeroed-
+    // context abort is the classic stack-overflow signature. This turns a
+    // mysterious wild jump into a named, fixable stack (bump its kStackSize).
+    {
+        const int bad_stk = index::kernel_stack_canary_check();
+        if (bad_stk >= 0) {
+            district::write("\n  [STACKGUARD] OVERFLOW: ");
+            if (bad_stk >= 2000) district::write("boot main stack");
+            else if (bad_stk >= 1000) { district::write("secondary cpu "); district::dec(static_cast<uint64_t>(bad_stk - 1000)); }
+            else { district::write("sister stack slot "); district::dec(static_cast<uint64_t>(bad_stk)); }
+        } else {
+            district::write("\n  [STACKGUARD] canaries intact (not a stack overflow)");
+        }
+    }
 
     // Kernel stacks live in the high-half (TTBR1) mapping of RAM
     // [0x40000000,0x80000000). Bound EVERY dereference to that window so the

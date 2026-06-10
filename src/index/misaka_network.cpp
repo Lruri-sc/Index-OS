@@ -342,18 +342,32 @@ void network_tick(uint64_t *frame) {
         // every esper's wait state + the pty rings + sockets every ~2 s. The
         // dump appearing at all also proves CPU0 is still ticking (vs a wedged
         // core). Silent when no connection. Remove once the pty hang is fixed.
-        static uint32_t wd_ticks = 0;
+        // Keep large downloads (apt) from stalling on HVF: while a TCP connection
+        // is live, re-ring the virtio-net RX doorbell each tick to force a vm-exit
+        // so qemu's main loop gets the BQL, runs SLIRP, and delivers pending RX.
+        // Without this a busy-spinning guest (apt http recv + doorbell-poll ext2
+        // write) starves qemu's main thread and the download stalls. This is the
+        // clean replacement for the old [WD] console-dump, which inadvertently
+        // supplied these vm-exit kicks -- disabling that dump made apt-get update
+        // stall at "Get:1 InRelease". (The verbose [WD] esper-state dump for the
+        // pty hang is gone; that hang is fixed.)
         if (!g_panicked && antenna_has_active_socket()) {
-            if ((wd_ticks % 200u) == 0u) {
-                esper_watchdog_dump();
-                sr_report();
-                inc_report();     // [WD] privsep AF_UNIX channels (where does the 139B stall?)
-                aiwass_report();  // [WD] privsep pipes
-                antenna_report();
-            }
-            ++wd_ticks;
-        } else {
-            wd_ticks = 0;
+            // Re-ring the virtio-net RX doorbell each tick while a TCP socket is
+            // live: a vm-exit that lets qemu deliver any SLIRP-buffered RX into the
+            // ring (we drain it just above). Got apt-get update's download flowing
+            // from "Get:1" to ~97% of InRelease. (The remaining ~3% is the server
+            // truncating apt's connection -- busybox wget completes the same 270KB
+            // download over this same TCP stack, so it is NOT an Index TCP bug; see
+            // apt-chroot.md part8.)
+            drivers::misaka_mail_kick_rx();
+            // NOTE: the *tail* of a large real-mirror download (apt InRelease ~97%
+            // / "261KB" stall) is delivered unreliably while the reader is parked:
+            // virtio-net RX IRQ is gated off on HVF GICv3 (enabling SPI 35-38 hangs
+            // probe), so RX-during-park rides this single doorbell poll, which is
+            // enough for the bulk but not the trailing segments. An in-tick yield-
+            // spin "fix" worked once but was unreliable + heavy in the IRQ; the real
+            // fix needs the virtio RX IRQ (currently blocked). DNS + bulk download
+            // work; large-file completion on real mirrors is the remaining gap.
         }
     }
     if (g_user_mode && g_user_tick != nullptr) {
@@ -1126,5 +1140,10 @@ uint32_t misaka_network_online_cpus() {
 uint32_t misaka_network_count() {
     return g_count;
 }
+
+// Public wrapper so the crash dumper (kernel.cpp exception_report) can name a
+// clobbered kernel-stack canary AT fault time -- the real check + the canary
+// globals live in this file's anonymous namespace, still in scope here.
+int kernel_stack_canary_check() { return stack_canary_check(); }
 
 } // namespace index

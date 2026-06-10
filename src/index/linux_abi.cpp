@@ -268,13 +268,19 @@ bool resolve_path(Esper *e, const char *dirfd_path, const char *path,
         return false;
     }
     // Stage 1: build a flat "base + / + path" into g_path_join.
+    // chroot: absolute paths resolve UNDER e->root_dir (empty == no chroot, so
+    // this is identical to before); ".." is floored at root_depth in stage 2 so
+    // the jail can't be escaped. Relative paths inherit the prefix through the
+    // cwd / dirfd base, both of which are stored as REAL (root-prefixed) paths.
+    const char *root = (e != nullptr) ? e->root_dir : "";
+    const uint32_t root_floor = (e != nullptr) ? e->root_depth : 0;
     uint32_t n = 0;
     if (path[0] == '/') {
-        // Absolute: ignore the base entirely.
-        while (path[n] != 0 && n + 1 < kCwdCap) {
-            g_path_join[n] = path[n];
-            ++n;
-        }
+        // Absolute: ignore the cwd base, but prepend the chroot root (if any).
+        uint32_t ri = 0;
+        while (root[ri] != 0 && n + 1 < kCwdCap) g_path_join[n++] = root[ri++];
+        uint32_t pi = 0;
+        while (path[pi] != 0 && n + 1 < kCwdCap) g_path_join[n++] = path[pi++];
         g_path_join[n] = 0;
     } else {
         const char *base = (dirfd_path != nullptr && dirfd_path[0] != 0)
@@ -315,7 +321,9 @@ bool resolve_path(Esper *e, const char *dirfd_path, const char *path,
         if (is_dot) {
             // no-op
         } else if (is_dotdot) {
-            if (depth > 0) {
+            // Floor at root_floor (the chroot root's component count) so ".."
+            // can never climb above the jail root. root_floor==0 == no chroot.
+            if (depth > root_floor) {
                 --depth;
                 out_n = starts[depth];
             }
@@ -1342,23 +1350,29 @@ void linux_syscall_dispatch(uint64_t *frame) {
             SisterRelay *r = sr_at(me->fds[fd].sock_idx);
             if (r) r->slave_locked = (lock != 0);
             frame[0] = 0;
-        } else if (req == 0x5401 /*TCGETS*/ && is_tty && arg != 0 && ensure_user(me, arg, 64)) {
-            // For pty fds, return that pty's saved termios; for console use the global.
+        } else if (req == 0x5401 /*TCGETS*/ && is_tty && arg != 0 && ensure_user(me, arg, 36)) {
+            // The kernel `struct termios` TCGETS fills is EXACTLY 36 bytes
+            // (4 tcflag_t + c_line + c_cc[NCCS=19]); glibc's tcgetattr passes a
+            // 36-byte __kernel_termios. Writing 44 (a termios2-sized blob) here
+            // overran the caller's buffer by 8 bytes and smashed its stack canary
+            // -- "*** stack smashing detected ***" aborted dpkg-deb's file
+            // extraction whenever its stdout was a tty (so `apt install`'s dpkg
+            // --unpack died; the bug hid when stdout was redirected to a file).
             const uint8_t *t = termios_blob();
             if (kk == FdKind::pty_master || kk == FdKind::pty_slave) {
                 SisterRelay *r = sr_at(me->fds[fd].sock_idx);
                 if (r) t = r->termios;
             }
-            for (uint32_t i = 0; i < 44; ++i) reinterpret_cast<uint8_t *>(arg)[i] = t[i];
+            for (uint32_t i = 0; i < 36; ++i) reinterpret_cast<uint8_t *>(arg)[i] = t[i];
             frame[0] = 0;
         } else if ((req == 0x5402 || req == 0x5403 || req == 0x5404) /*TCSETS/W/F*/ &&
-                   is_tty && arg != 0 && ensure_user(me, arg, 64)) {
+                   is_tty && arg != 0 && ensure_user(me, arg, 36)) {
             uint8_t *t = termios_blob();
             if (kk == FdKind::pty_master || kk == FdKind::pty_slave) {
                 SisterRelay *r = sr_at(me->fds[fd].sock_idx);
                 if (r) t = r->termios;
             }
-            for (uint32_t i = 0; i < 44; ++i) t[i] = reinterpret_cast<const uint8_t *>(arg)[i];
+            for (uint32_t i = 0; i < 36; ++i) t[i] = reinterpret_cast<const uint8_t *>(arg)[i];
             // If this TCSETS is for the console (not a pty), republish ISIG +
             // VINTR for the PL011 IRQ-path SIGINT generator. c_lflag at byte
             // 12 (bit 0 = ISIG); c_cc[VINTR] at byte 17.
@@ -1443,24 +1457,55 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint64_t path_va = frame[1];
         const uint64_t flags = frame[2];
         if (!ensure_user(me, path_va, 1)) { frame[0] = static_cast<uint64_t>(-14); return; }
-        const bool writable = (flags & 0x3) != 0;       // O_WRONLY(1) | O_RDWR(2)
-        const bool create = (flags & 0x40) != 0;        // O_CREAT
+        const bool tmpfile = (flags & 0x400000) != 0;   // __O_TMPFILE: anon temp in a dir
+        const bool writable = (flags & 0x3) != 0 || tmpfile; // O_WRONLY(1) | O_RDWR(2)
+        const bool create = (flags & 0x40) != 0 || tmpfile;  // O_CREAT (O_TMPFILE always creates)
+        const bool excl = (flags & 0x80) != 0 && !tmpfile;   // O_EXCL (with O_CREAT)
         const bool trunc = (flags & 0x200) != 0;        // O_TRUNC
         const bool append = (flags & 0x400) != 0;       // O_APPEND
         char abs[kCwdCap];
         if (!resolve_at(me, dirfd, reinterpret_cast<const char *>(path_va), abs, kCwdCap)) {
             frame[0] = static_cast<uint64_t>(-2); return;
         }
+        // O_CREAT|O_EXCL on an existing path must fail EEXIST. GNU tar extracts
+        // every file with open(O_CREAT|O_EXCL) and falls back to unlink+retry on
+        // EEXIST -- with O_EXCL ignored, extraction over a leftover file silently
+        // skipped both the truncate and the unlink, so a shorter new file kept
+        // the old file's tail bytes (dpkg-deb --control over dpkg's lingering
+        // tmp.ci produced a control file with the previous package's trailing
+        // lines -- the apt "parsing file tmp.ci/control: field name 'ano'" abort).
+        if (create && excl) {
+            LateranEntry exst = {};
+            if (lateran_stat_nofollow(abs, &exst) || lateran_is_dir(abs)) {
+                frame[0] = static_cast<uint64_t>(-17); // -EEXIST
+                return;
+            }
+        }
+        // Chroot-relative view for the synthetic /dev/* lookups below: resolve_at
+        // prepends the chroot root (me->root_dir) to absolute paths, so inside a
+        // chroot abs is e.g. "/apt-debian/dev/null" -- which str_eq(abs,"/dev/null")
+        // never matches. The rootfs's /dev is usually empty, so /dev/null etc.
+        // then failed ENOENT *inside every chroot*. dpkg --unpack opens /dev/null
+        // to wire its decompressor's stdin: that ENOENT broke the control-tar
+        // stream and surfaced as "package control information contained directory".
+        const char *dev = abs;
+        if (me->root_dir[0] != 0) {
+            uint32_t rl = 0; while (me->root_dir[rl] != 0) ++rl;
+            bool pref = true;
+            for (uint32_t i = 0; i < rl; ++i) if (abs[i] != me->root_dir[i]) { pref = false; break; }
+            // Component boundary: "/apt-debianX" must NOT match root "/apt-debian".
+            if (pref && (abs[rl] == '/' || abs[rl] == 0)) { dev = abs + rl; if (dev[0] == 0) dev = "/"; }
+        }
 
         // /dev/* synthetic devices come ahead of the on-disk lookup so they
         // work even when the rootfs has no device nodes.
         {
             FdKind dk = FdKind::closed;
-            if (str_eq(abs, "/dev/null")) dk = FdKind::devnull;
-            else if (str_eq(abs, "/dev/zero")) dk = FdKind::devzero;
-            else if (str_eq(abs, "/dev/random") || str_eq(abs, "/dev/urandom"))
+            if (str_eq(dev, "/dev/null")) dk = FdKind::devnull;
+            else if (str_eq(dev, "/dev/zero")) dk = FdKind::devzero;
+            else if (str_eq(dev, "/dev/random") || str_eq(dev, "/dev/urandom"))
                 dk = FdKind::devrandom;
-            else if (str_eq(abs, "/dev/tty") || str_eq(abs, "/dev/console"))
+            else if (str_eq(dev, "/dev/tty") || str_eq(dev, "/dev/console"))
                 dk = FdKind::devtty;
             if (dk != FdKind::closed) {
                 int dfd = -1;
@@ -1478,7 +1523,7 @@ void linux_syscall_dispatch(uint64_t *frame) {
 
         // /dev/ptmx -- allocate a fresh SisterRelay pair, hand back the master.
         // /dev/pts/N -- open the slave end of pair N (must be unlocked).
-        if (str_eq(abs, "/dev/ptmx")) {
+        if (str_eq(dev, "/dev/ptmx")) {
             const int si = sr_alloc();
             if (si < 0) { frame[0] = static_cast<uint64_t>(-23); return; }
             int dfd = -1;
@@ -1495,11 +1540,11 @@ void linux_syscall_dispatch(uint64_t *frame) {
             frame[0] = static_cast<uint64_t>(dfd);
             return;
         }
-        if (abs[0] == '/' && abs[1] == 'd' && abs[2] == 'e' && abs[3] == 'v' &&
-            abs[4] == '/' && abs[5] == 'p' && abs[6] == 't' && abs[7] == 's' &&
-            abs[8] == '/') {
+        if (dev[0] == '/' && dev[1] == 'd' && dev[2] == 'e' && dev[3] == 'v' &&
+            dev[4] == '/' && dev[5] == 'p' && dev[6] == 't' && dev[7] == 's' &&
+            dev[8] == '/') {
             int n = 0;
-            const char *p = abs + 9;
+            const char *p = dev + 9;
             if (*p < '0' || *p > '9') { frame[0] = static_cast<uint64_t>(-2); return; }
             while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); ++p; }
             if (*p != 0) { frame[0] = static_cast<uint64_t>(-2); return; }
@@ -1517,6 +1562,31 @@ void linux_syscall_dispatch(uint64_t *frame) {
             me->fds[dfd].kind = FdKind::pty_slave;
             me->fds[dfd].sock_idx = si;
             frame[0] = static_cast<uint64_t>(dfd);
+            return;
+        }
+
+        // O_TMPFILE: `abs` is a DIRECTORY and the caller wants an unnamed temp file
+        // in it. Index has no anonymous inodes, so synthesize a uniquely-named
+        // regular file ".idxtmp.<hex>" inside the directory and hand that fd back
+        // (writable). apt-key/gpg and apt's acquire methods use O_TMPFILE; without
+        // this the open resolved the directory itself -> write() returned -1
+        // (EPERM) -> "Write error - write (1: Operation not permitted)".
+        if (tmpfile) {
+            static uint64_t g_otmpfile_ctr = 0;
+            const uint64_t id = __atomic_add_fetch(&g_otmpfile_ctr, 1, __ATOMIC_RELAXED);
+            char tpath[kCwdCap];
+            uint32_t n = 0;
+            for (uint32_t i = 0; abs[i] != 0 && n + 1 < sizeof(tpath); ++i) tpath[n++] = abs[i];
+            if (n > 0 && tpath[n - 1] != '/' && n + 1 < sizeof(tpath)) tpath[n++] = '/';
+            const char *pfx = ".idxtmp.";
+            for (uint32_t i = 0; pfx[i] != 0 && n + 1 < sizeof(tpath); ++i) tpath[n++] = pfx[i];
+            for (int sh = 60; sh >= 0 && n + 1 < sizeof(tpath); sh -= 4) {
+                const uint32_t nib = static_cast<uint32_t>((id >> sh) & 0xF);
+                tpath[n++] = static_cast<char>(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
+            }
+            tpath[n] = 0;
+            const int tfd = linux_file_open_ex(me, tpath, /*create=*/true, /*trunc=*/true, /*writable=*/true);
+            frame[0] = (tfd >= 0) ? static_cast<uint64_t>(tfd) : static_cast<uint64_t>(-2);
             return;
         }
 
@@ -1543,20 +1613,46 @@ void linux_syscall_dispatch(uint64_t *frame) {
         return;
     }
     case 35 /*unlinkat*/: {
-        // unlinkat(dirfd, path, flags): remove a file (dirfd ignored except
-        // for AT_FDCWD-vs-real-dirfd path resolution).
+        // unlinkat(dirfd, path, flags): remove a file, or a directory when
+        // AT_REMOVEDIR (0x200) is set (that's how glibc rmdir() is implemented).
         if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
         const int32_t dirfd = static_cast<int32_t>(frame[0]);
         const uint64_t path_va = frame[1];
+        const uint64_t flags = frame[2];
         if (!ensure_user(me, path_va, 1)) { frame[0] = static_cast<uint64_t>(-14); return; }
         char abs[kCwdCap];
         if (!resolve_at(me, dirfd, reinterpret_cast<const char *>(path_va), abs, kCwdCap)) {
             frame[0] = static_cast<uint64_t>(-2); return;
         }
-        const bool was_dir = lateran_is_dir(abs); // capture before removal (IN_ISDIR)
+        const bool want_dir = (flags & 0x200) != 0; // AT_REMOVEDIR
+        const bool is_dir = lateran_is_dir(abs);
+        // Enforce the type/flag contract. rmdir() on a non-directory MUST fail
+        // with ENOTDIR, and unlink() on a directory MUST fail with EISDIR --
+        // ignoring the flag (the old behaviour: unlink anything, return 0) broke
+        // dpkg's control-info validation, which does rmdir(tmp.ci/control) and
+        // reads the expected ENOTDIR as proof the entry is a regular file. With
+        // rmdir() spuriously succeeding, dpkg both DELETED the control file and
+        // aborted with "package control information contained directory".
+        if (want_dir != is_dir) {
+            LateranEntry st = {};
+            const bool exists = is_dir || lateran_stat(abs, &st);
+            if (!exists) { frame[0] = static_cast<uint64_t>(-2); return; } // -ENOENT
+            frame[0] = static_cast<uint64_t>(want_dir ? -20 /*ENOTDIR*/ : -21 /*EISDIR*/);
+            return;
+        }
         const bool ok = lateran_unlink(abs);
-        if (ok) kazakiri_notify(abs, IN_DELETE | (was_dir ? IN_ISDIR : 0u));
-        frame[0] = ok ? 0 : static_cast<uint64_t>(-2); // -ENOENT
+        if (ok) kazakiri_notify(abs, IN_DELETE | (is_dir ? IN_ISDIR : 0u));
+        // rmdir() of an EXISTING but non-empty directory must be -ENOTEMPTY,
+        // not -ENOENT. dpkg's recursive remove (path_remove) tries rmdir first
+        // and recurses into the contents ONLY on ENOTEMPTY; our old ENOENT told
+        // it "already gone", so /var/lib/dpkg/tmp.ci survived between installs
+        // and the next dpkg-deb control extraction landed on stale files (the
+        // "field name 'ano'" parse aborts -- nano's control tail bleeding into
+        // htop's). The dir is known to exist here (is_dir above), so a failed
+        // dir unlink means "not empty".
+        frame[0] = ok ? 0
+                      : static_cast<uint64_t>(want_dir ? -39 /*ENOTEMPTY*/
+                                                       : -2 /*ENOENT*/);
         return;
     }
     case 34 /*mkdirat*/: {
@@ -1767,7 +1863,23 @@ void linux_syscall_dispatch(uint64_t *frame) {
             frame[0] = static_cast<uint64_t>(-2); return;
         }
         if (str_prefix(abs, "/dev/pts/") || str_eq(abs, "/dev/ptmx")) { frame[0] = 0; return; }
-        frame[0] = lateran_chown(abs, uid, gid) ? 0 : static_cast<uint64_t>(-2);
+        if (lateran_chown(abs, uid, gid)) { frame[0] = 0; return; }
+        // lateran_chown resolves THROUGH a final symlink, so lchown()
+        // (AT_SYMLINK_NOFOLLOW) of a symlink whose target doesn't exist (yet)
+        // failed ENOENT -- dpkg does exactly that on every extracted symlink
+        // ("error setting ownership of symlink 'lessfile.dpkg-new'"), aborting
+        // less/nano/htop installs. If the LEAF itself is a symlink, treat the
+        // chown as a no-op success (single-user system: link ownership is
+        // cosmetic). The readlink probe runs only on this cold failure path.
+        {
+            // 512B: ext2_readlink fails (-1) when the target exceeds the cap,
+            // so a tiny probe buffer would mis-classify ordinary symlinks.
+            char sl[512];
+            if (lateran_readlink(abs, sl, sizeof(sl)) >= 0) {
+                frame[0] = 0; return;
+            }
+        }
+        frame[0] = static_cast<uint64_t>(-2);
         return;
     }
     case 37 /*linkat*/: {
@@ -1793,6 +1905,48 @@ void linux_syscall_dispatch(uint64_t *frame) {
         // QEMU is mounted cache=directsync, so guest writes already hit the
         // host image atomically; nothing buffered to flush. Honest answer is 0.
         frame[0] = 0;
+        return;
+    case 227 /*msync*/:
+        // Flush a file-backed mmap to its backing store. Index's writable mmap
+        // writes are already visible in the mapped pages, and apt's pkgcache.bin
+        // lives on the tmpfs idxapt mounts over /var/cache/apt (no disk to sync),
+        // so there is nothing to flush -- report success. Without this apt's
+        // "Reading package lists" died: "Unable to synchronize mmap - msync
+        // (38: Function not implemented)" -> the whole `apt update` failed.
+        frame[0] = 0;
+        return;
+    case 84 /*sync_file_range*/:
+        // Flush a byte range of a file. Same story as fsync (writes already hit
+        // the backing store / are in-memory on tmpfs): nothing buffered to flush.
+        // dpkg calls this while writing its database; returning -ENOSYS aborted it.
+        frame[0] = 0;
+        return;
+    case 223 /*fadvise64*/:
+        // Access-pattern hint (WILLNEED/DONTNEED/SEQUENTIAL). Purely advisory;
+        // ignoring it is always correct. dpkg/tar issue it while reading archives.
+        frame[0] = 0;
+        return;
+    case 232 /*mincore*/:
+        // mincore(addr, length, vec): report page residency. Answering SUCCESS
+        // with "all resident" perturbed the JDK's CDS archive validation (the
+        // JVM mincores classes.jsa and a resident verdict broke its mapping
+        // check -> "[cds] error processing the shared archive file"). The HotSpot
+        // and glibc callers all tolerate -ENOSYS, so answer it *quietly* via this
+        // explicit case (suppresses the generic unknown-syscall console flood
+        // dpkg/apt produced) -- identical behaviour to the pre-existing fallback.
+        frame[0] = static_cast<uint64_t>(-38); // -ENOSYS
+        return;
+    // Extended attributes: Index's filesystems (ext2/tmpfs as built) carry no
+    // xattrs, so report "not supported" rather than -ENOSYS. GNU coreutils ls,
+    // tar, and dpkg probe xattrs (security.*, system.posix_acl_*) on every file
+    // and treat -ENOSYS as a hard error ("ls: .: Function not implemented"),
+    // whereas -EOPNOTSUPP is the documented "this fs has no xattrs" and is
+    // handled gracefully (ls shows no '+', tar skips xattrs, dpkg unpacks).
+    case 5  /*setxattr*/:   case 6  /*lsetxattr*/:  case 7  /*fsetxattr*/:
+    case 8  /*getxattr*/:   case 9  /*lgetxattr*/:  case 10 /*fgetxattr*/:
+    case 11 /*listxattr*/:  case 12 /*llistxattr*/: case 13 /*flistxattr*/:
+    case 14 /*removexattr*/:case 15 /*lremovexattr*/:case 16 /*fremovexattr*/:
+        frame[0] = static_cast<uint64_t>(-95); // -EOPNOTSUPP/-ENOTSUP
         return;
     case 88 /*utimensat*/: {
         if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
@@ -1836,7 +1990,18 @@ void linux_syscall_dispatch(uint64_t *frame) {
             if (m_ns == kUtimeNow) mtime = now;
             else if (m_ns != kUtimeOmit) mtime = ts[2];
         }
-        frame[0] = lateran_utime(abs, atime, mtime) ? 0 : static_cast<uint64_t>(-2);
+        if (lateran_utime(abs, atime, mtime)) { frame[0] = 0; return; }
+        // Same symlink hazard as fchownat: lateran_utime follows a final symlink,
+        // so utimensat on a symlink whose target doesn't exist yet (dpkg sets the
+        // timestamp of every extracted symlink, e.g. 'lessfile.dpkg-new' ->
+        // 'less' before 'less' lands) fails ENOENT and aborts the install. A
+        // symlink leaf has no meaningful mtime of its own here -> treat as a
+        // no-op success when the leaf itself is a symlink.
+        {
+            char sl[512];
+            if (lateran_readlink(abs, sl, sizeof(sl)) >= 0) { frame[0] = 0; return; }
+        }
+        frame[0] = static_cast<uint64_t>(-2);
         return;
     }
     case 48 /*faccessat*/:
@@ -1893,7 +2058,16 @@ void linux_syscall_dispatch(uint64_t *frame) {
             *reinterpret_cast<uint64_t *>(d + 0) = dents[i].first_cluster + 2; // d_ino
             *reinterpret_cast<int64_t *>(d + 8) = static_cast<int64_t>(i + 1); // d_off
             *reinterpret_cast<uint16_t *>(d + 16) = static_cast<uint16_t>(reclen);
-            d[18] = dents[i].is_dir ? 4 /*DT_DIR*/ : 8 /*DT_REG*/;
+            // d_type = the S_IFMT nibble (DTTOIF is d_type<<12), so symlinks
+            // report DT_LNK(10), not DT_REG. ldconfig trusts d_type for its
+            // is_link decision: with symlinks mislabelled DT_REG it skipped the
+            // follow-stat, processed both libX.so.1 AND libX.so.1.0 links to the
+            // same real library, and inserted the same (ino,ctime,size,dev) id
+            // twice into its aux-cache -- insert_to_aux_cache() abort()s on a
+            // duplicate (exit 134), failing libc-bin's ldconfig trigger.
+            d[18] = dents[i].mode != 0
+                        ? static_cast<uint8_t>((dents[i].mode >> 12) & 0xF)
+                        : (dents[i].is_dir ? 4 /*DT_DIR*/ : 8 /*DT_REG*/);
             for (uint32_t b = 0; b < nlen; ++b) d[19 + b] = static_cast<uint8_t>(dents[i].name[b]);
             used += reclen;
         }
@@ -2059,10 +2233,12 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint64_t fd = frame[0];
         uint64_t st_va = (nr == 80) ? frame[1] : frame[2];
         bool by_path = false;
+        bool nofollow = false; // AT_SYMLINK_NOFOLLOW: lstat() must NOT follow
         char abs[kCwdCap];
         if (nr == 79) {
             const uint64_t path_va = frame[1];
             const uint64_t flags = frame[3];
+            nofollow = (flags & 0x100) != 0;
             st_va = frame[2];
             // AT_EMPTY_PATH (0x1000): stat the dirfd itself; else resolve path.
             if (!(flags & 0x1000) && path_va != 0) {
@@ -2115,8 +2291,18 @@ void linux_syscall_dispatch(uint64_t *frame) {
                 *reinterpret_cast<uint64_t *>(st + 32) = (5u << 8) | 2u;
                 frame[0] = 0; return;
             }
+            // lstat (AT_SYMLINK_NOFOLLOW): report the LEAF itself. For a
+            // symlink that means S_IFLNK, size = target length, and -- just as
+            // important -- the link's OWN ino/ctime: glibc ldconfig keys its
+            // aux-cache on (st_ino, st_ctime, st_size, st_dev) from lstat, and
+            // partial/zeroed identity here collides ids across files, tripping
+            // insert_to_aux_cache's abort() (exit 134 in libc-bin's trigger).
+            // update-alternatives also needs the S_IFLNK type for
+            // /etc/alternatives/<name> or it bails "cannot stat".
             LateranEntry meta = {};
-            if (lateran_stat(abs, &meta)) {
+            const bool got = nofollow ? lateran_stat_nofollow(abs, &meta)
+                                      : lateran_stat(abs, &meta);
+            if (got) {
                 *mode = meta.mode != 0 ? meta.mode : (meta.is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644));
                 *size = meta.is_dir ? 0 : meta.size;
                 *st_uid = meta.uid;
@@ -2189,15 +2375,10 @@ void linux_syscall_dispatch(uint64_t *frame) {
     }
 
     case 291 /*statx*/:
-        // statx: the JDK's NIO prefers it but falls back to newfstatat(79) on
-        // -ENOSYS -- and javac works fine via that fallback (verified end-to-end:
-        // the triple-indirect build below compiled + ran a class). A full statx
-        // that returned SUCCESS changed the JDK's file-attribute path and
-        // *deterministically* tripped a separate crash in the EL0 context-restore
-        // (FAR=user garbage), so we deliberately stay on the proven fallback and
-        // answer -ENOSYS *quietly*: the explicit case suppresses the per-call
-        // unknown-syscall console spam javac produced by the hundred. Mirrors a
-        // kernel built without statx; revisit a real impl with careful debugging.
+        // statx: kept on the proven newfstatat(79) fallback path. A real statx
+        // that returns SUCCESS perturbs the JDK's CDS/file-attribute path
+        // (classes.jsa validation fails) and does NOT fix dpkg's control-info
+        // type check, so answer -ENOSYS quietly (suppresses javac's per-call spam).
         frame[0] = static_cast<uint64_t>(-38); // -ENOSYS
         return;
 
@@ -2871,6 +3052,24 @@ void linux_syscall_dispatch(uint64_t *frame) {
                 frame[0] = 0;
                 return;
             }
+            if (cmd == 3 /*F_GETFL*/) {
+                // Report the access mode + O_NONBLOCK so a program that GETFLs,
+                // ORs O_NONBLOCK, and SETFLs (apt's method does exactly this on
+                // its pipes) round-trips correctly.
+                uint64_t fl = me->fds[fd].writable ? 2u /*O_RDWR*/ : 0u /*O_RDONLY*/;
+                if (me->fds[fd].nonblock) fl |= 0x800u; // O_NONBLOCK
+                frame[0] = fl;
+                return;
+            }
+            if (cmd == 4 /*F_SETFL*/) {
+                // Track O_NONBLOCK (was a silent no-op). Pipe read/write honour it
+                // -> -EAGAIN instead of parking, so a non-blocking select loop
+                // works (apt-get update's http method was stuck parked in read()
+                // on its command pipe because O_NONBLOCK was ignored).
+                me->fds[fd].nonblock = (arg & 0x800u /*O_NONBLOCK*/) != 0;
+                frame[0] = 0;
+                return;
+            }
         }
         if (cmd == 0 /*F_DUPFD*/ || cmd == 1030 /*F_DUPFD_CLOEXEC*/) {
             // Real dup to the lowest free fd >= arg. The old stub returned 0,
@@ -3092,11 +3291,104 @@ void linux_syscall_dispatch(uint64_t *frame) {
         }
     }
     case 72 /*pselect6*/: {
-        // Same shape as ppoll: claim all fds in readfds/writefds are ready.
-        // Args: nfds, readfds, writefds, exceptfds, timeout, sigmask. We
-        // leave the bitmaps alone (caller already set them); just return nfds.
-        frame[0] = frame[0]; // nfds passes through unchanged
-        return;
+        // Real select, mirroring ppoll's per-fd readiness + park. The old stub
+        // returned nfds claiming EVERY fd ready without checking or blocking;
+        // apt's method IPC (apt-get <-> /usr/lib/apt/methods/http over pipes)
+        // then read an empty pipe and blocked forever -> apt-get update hung
+        // (deadlock). select<->poll mapping (Linux do_select): readable =
+        // POLLIN|POLLHUP|POLLERR, writable = POLLOUT|POLLERR, except = POLLPRI.
+        // Args: nfds, readfds, writefds, exceptfds, timeout(timespec), sigmask
+        // {const sigset_t*, size_t}.
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
+        const uint64_t a0_nfds = frame[0];
+        const uint64_t nfds = a0_nfds;
+        const uint64_t rfds_va = frame[1];
+        const uint64_t wfds_va = frame[2];
+        const uint64_t efds_va = frame[3];
+        const uint64_t tmo_va = frame[4];
+        const uint64_t sigarg_va = frame[5];
+        if (nfds > 1024) { frame[0] = static_cast<uint64_t>(-22); return; } // FD_SETSIZE
+        const uint64_t words = (nfds + 63) / 64; // <= 16
+        const int pidx = esper_running_index();
+        constexpr uint32_t kPIN = 0x1, kPRI = 0x2, kPOUT = 0x4, kPERR = 0x8, kPHUP = 0x10;
+        // sigmask once on first entry (see ppoll's rationale); 6th arg is a
+        // {sigset_t *ss; size_t} struct, not the sigset directly.
+        uint64_t eff_mask;
+        if (me->poll_armed) {
+            eff_mask = me->poll_eff_mask;
+        } else {
+            eff_mask = me->sig_mask;
+            if (sigarg_va != 0 && ensure_user(me, sigarg_va, 8)) {
+                const uint64_t ss = *reinterpret_cast<const uint64_t *>(sigarg_va);
+                if (ss != 0 && ensure_user(me, ss, 8)) eff_mask = *reinterpret_cast<const uint64_t *>(ss);
+            }
+            me->poll_eff_mask = eff_mask;
+        }
+        auto fdset_ok = [&](uint64_t va) -> bool {
+            return va == 0 || (va < 0x8000000000ULL && ensure_user(me, va, words * 8));
+        };
+        const bool ptrs_ok = fdset_ok(rfds_va) && fdset_ok(wfds_va) && fdset_ok(efds_va);
+        for (;;) {
+            const uint32_t gen0 = linux_poll_gen();
+            { // deliverable signal interrupts the wait (mirror ppoll)
+                const uint64_t deliverable = me->sig_pending & ~eff_mask;
+                if (deliverable != 0) {
+                    const int sig = __builtin_ctzll(deliverable) + 1;
+                    frame[0] = static_cast<uint64_t>(-4); // -EINTR
+                    if (linux_deliver_signal(me, sig, frame)) { me->poll_armed = false; return; }
+                    frame[0] = a0_nfds; // restore the arg for replay
+                    const uint64_t h = me->sig_handler[sig];
+                    if (h == 0 || h == 1) me->sig_pending &= ~(1ULL << (sig - 1));
+                }
+            }
+            uint64_t rout[16] = {0}, wout[16] = {0}, eout[16] = {0};
+            uint64_t count = 0;
+            if (ptrs_ok) {
+                for (uint64_t fd = 0; fd < nfds; ++fd) {
+                    const uint64_t w = fd >> 6, b = 1ULL << (fd & 63);
+                    const bool wr = rfds_va != 0 && (reinterpret_cast<const uint64_t *>(rfds_va)[w] & b);
+                    const bool ww = wfds_va != 0 && (reinterpret_cast<const uint64_t *>(wfds_va)[w] & b);
+                    const bool we = efds_va != 0 && (reinterpret_cast<const uint64_t *>(efds_va)[w] & b);
+                    if (!wr && !ww && !we) continue;
+                    const uint32_t re = linux_fd_revents(me, static_cast<int>(fd));
+                    if (wr && (re & (kPIN | kPHUP | kPERR))) { rout[w] |= b; ++count; }
+                    if (ww && (re & (kPOUT | kPERR)))        { wout[w] |= b; ++count; }
+                    if (we && (re & kPRI))                   { eout[w] |= b; ++count; }
+                }
+            }
+            if (count > 0) {
+                for (uint64_t w = 0; w < words; ++w) {
+                    if (rfds_va) reinterpret_cast<uint64_t *>(rfds_va)[w] = rout[w];
+                    if (wfds_va) reinterpret_cast<uint64_t *>(wfds_va)[w] = wout[w];
+                    if (efds_va) reinterpret_cast<uint64_t *>(efds_va)[w] = eout[w];
+                }
+                me->poll_armed = false; frame[0] = count; return;
+            }
+            if (!me->poll_armed) {
+                me->poll_armed = true;
+                if (tmo_va == 0 || !ensure_user(me, tmo_va, 16)) {
+                    me->poll_deadline = 0; // infinite
+                } else {
+                    const uint64_t sec  = *reinterpret_cast<const uint64_t *>(tmo_va);
+                    const uint64_t nsec = *reinterpret_cast<const uint64_t *>(tmo_va + 8);
+                    me->poll_deadline = last_order_ticks() + sec * 100 + nsec / 10000000 + 1;
+                }
+            }
+            if (me->poll_deadline != 0 && last_order_ticks() >= me->poll_deadline) {
+                for (uint64_t w = 0; w < words; ++w) { // timeout: zero the sets
+                    if (rfds_va) reinterpret_cast<uint64_t *>(rfds_va)[w] = 0;
+                    if (wfds_va) reinterpret_cast<uint64_t *>(wfds_va)[w] = 0;
+                    if (efds_va) reinterpret_cast<uint64_t *>(efds_va)[w] = 0;
+                }
+                me->poll_armed = false; frame[0] = 0; return;
+            }
+            if (pidx < 0) { me->poll_armed = false; frame[0] = 0; return; }
+            if (ipc_park_unless_ready(pidx, Esper::IpcWaitKind::PollWait,
+                                      static_cast<int>(gen0), frame,
+                                      poll_gen_changed, eff_mask)) {
+                return; // parked; svc replays pselect6 on wake
+            }
+        }
     }
     case 71 /*sendfile*/: {
         // No fast-path: tell the caller it's not supported so musl falls
@@ -3135,12 +3427,20 @@ void linux_syscall_dispatch(uint64_t *frame) {
         if (me == nullptr) { frame[0] = static_cast<uint64_t>(-14); return; }
         const uint64_t buf_va = frame[0];
         const uint64_t size = frame[1];
+        // Report cwd RELATIVE to the chroot root (strip the root_dir prefix); a
+        // chrooted process must never see its real path above the jail root.
+        const char *vis = me->cwd;
+        if (me->root_dir[0] != 0) {
+            uint32_t rl = 0; while (me->root_dir[rl] != 0) ++rl;
+            vis = me->cwd + rl;        // cwd is always root_dir or below it
+            if (vis[0] == 0) vis = "/";
+        }
         uint32_t n = 0;
-        while (me->cwd[n] != 0 && n + 1 < kCwdCap) ++n;
+        while (vis[n] != 0 && n + 1 < kCwdCap) ++n;
         if (size < n + 1) { frame[0] = static_cast<uint64_t>(-34); return; } // -ERANGE
         if (!ensure_user(me, buf_va, n + 1)) { frame[0] = static_cast<uint64_t>(-14); return; }
         char *dst = reinterpret_cast<char *>(buf_va);
-        for (uint32_t i = 0; i < n; ++i) dst[i] = me->cwd[i];
+        for (uint32_t i = 0; i < n; ++i) dst[i] = vis[i];
         dst[n] = 0;
         frame[0] = buf_va;
         return;
@@ -3318,6 +3618,8 @@ void linux_syscall_dispatch(uint64_t *frame) {
         me->fds[fd] = Fd{};
         me->fds[fd].kind = kind;
         me->fds[fd].sock_idx = idx;
+        me->fds[fd].nonblock = (frame[1] & 0x800u) != 0;  // SOCK_NONBLOCK (musl DNS uses it)
+        me->fds[fd].cloexec  = (frame[1] & 0x80000u) != 0; // SOCK_CLOEXEC
         frame[0] = static_cast<uint64_t>(fd);
         return;
     }
@@ -3482,6 +3784,9 @@ void linux_syscall_dispatch(uint64_t *frame) {
             frame[0] = static_cast<uint64_t>(-9); return;
         }
         if (!ensure_user(me, buf, len)) { frame[0] = static_cast<uint64_t>(-14); return; }
+        // Honour non-blocking recv: the fd's O_NONBLOCK (socket()/fcntl) OR a
+        // per-call MSG_DONTWAIT (0x40). musl getaddrinfo relies on -EAGAIN here.
+        const bool nb = me->fds[fd].nonblock || (frame[3] & 0x40u /*MSG_DONTWAIT*/) != 0;
         int64_t r = 0;
         if (k == FdKind::socket) {
             uint8_t src_ip[4] = {};
@@ -3489,7 +3794,7 @@ void linux_syscall_dispatch(uint64_t *frame) {
             r = antenna_recvfrom(me->fds[fd].sock_idx,
                                   reinterpret_cast<uint8_t *>(buf),
                                   static_cast<uint32_t>(len),
-                                  src_ip, &src_port, 1000);
+                                  src_ip, &src_port, 1000, nb);
             if (r > 0 && src_va != 0 && ensure_user(me, src_va, 16)) {
                 uint8_t *sa = reinterpret_cast<uint8_t *>(src_va);
                 sa[0] = 2; sa[1] = 0;
@@ -4090,6 +4395,7 @@ void linux_syscall_dispatch(uint64_t *frame) {
         const uint32_t want = cap > sizeof(stage) ? sizeof(stage)
                                                   : static_cast<uint32_t>(cap);
         int64_t r = 0;
+        uint8_t udp_src_ip[4] = {}; uint16_t udp_src_port = 0; bool is_udp = false;
         if (want > 0) {
             // Non-blocking recv first; if the ring is empty, PARK (yield to the
             // scheduler) rather than busy-spinning a blocking recv with IRQs
@@ -4100,9 +4406,20 @@ void linux_syscall_dispatch(uint64_t *frame) {
             // also freezes the 100 Hz NIC-drain tick. Mirrors read()'s path.
             const int sidx = me->fds[fd].sock_idx;
             bool peer_gone = false;
-            r = (k == FdKind::unix_sock)
-                    ? inc_try_recv(sidx, stage, want, &peer_gone)
-                    : antenna_tcp_try_recv(sidx, stage, want, &peer_gone);
+            if (k == FdKind::unix_sock) {
+                r = inc_try_recv(sidx, stage, want, &peer_gone);
+            } else if (antenna_is_udp(sidx)) {
+                // ★ UDP: dequeue ONE datagram (non-blocking), capturing the source
+                // for msg_name. The old code ran antenna_tcp_try_recv for every
+                // AF_INET socket, which returns -EBADF on a UDP socket -- so musl
+                // getaddrinfo (which recvmsg's its UDP DNS socket) never got the
+                // reply and DNS failed (apt could only reach a raw-IP repo).
+                is_udp = true;
+                r = antenna_recvfrom(sidx, stage, want, udp_src_ip, &udp_src_port, 0, /*nonblock=*/true);
+                if (r == -11) r = 0; // -EAGAIN -> would-block; park below like TCP
+            } else {
+                r = antenna_tcp_try_recv(sidx, stage, want, &peer_gone);
+            }
             if (r == 0 && !peer_gone) {
                 const int eidx = esper_running_index();
                 const Esper::IpcWaitKind wk = (k == FdKind::unix_sock)
@@ -4126,6 +4443,23 @@ void linux_syscall_dispatch(uint64_t *frame) {
                 uint8_t *dst = reinterpret_cast<uint8_t *>(base);
                 for (uint64_t j = 0; j < len && off < static_cast<uint32_t>(r); ++j)
                     dst[j] = stage[off++];
+            }
+        }
+
+        // Fill msg_name with the datagram source (UDP) so a caller like musl's
+        // getaddrinfo can verify the DNS reply came from the nameserver. msghdr:
+        // msg_name ptr @0x00, msg_namelen (u32) @0x08.
+        if (is_udp && r > 0) {
+            const uint64_t name_va = *reinterpret_cast<const uint64_t *>(mh + 0x00);
+            const uint32_t name_cap = *reinterpret_cast<const uint32_t *>(mh + 0x08);
+            if (name_va != 0 && name_cap >= 16 && ensure_user(me, name_va, 16)) {
+                uint8_t *na = reinterpret_cast<uint8_t *>(name_va);
+                na[0] = 2; na[1] = 0; // AF_INET
+                na[2] = static_cast<uint8_t>(udp_src_port >> 8);
+                na[3] = static_cast<uint8_t>(udp_src_port & 0xff);
+                for (uint32_t i = 0; i < 4; ++i) na[4 + i] = udp_src_ip[i];
+                for (uint32_t i = 0; i < 8; ++i) na[8 + i] = 0;
+                *reinterpret_cast<uint32_t *>(mh + 0x08) = 16; // msg_namelen
             }
         }
 
@@ -4173,6 +4507,17 @@ void linux_syscall_dispatch(uint64_t *frame) {
         // would arrive here too -- we have no seccomp, so OpenSSH must be built
         // with the rlimit sandbox; accepting keeps the rlimit path's prctls
         // (DUMPABLE/KEEPCAPS/NO_NEW_PRIVS) from aborting it.
+        if (frame[0] == 0x49445843u /*PR_INDEX_SET_CPUS ('IDXC')*/) {
+            // Index-private: cap the number of cores that schedule EL0. The apt
+            // wrapper drops this to 1 around a real-mirror download and restores
+            // it after: a large multi-process download at smp>1 intermittently
+            // trips the deep-SMP "zeroed-context ELR=0" residual (all tractable
+            // code-causes are fixed; it is HVF-level / smp=1 is 100% stable), and
+            // apt is download-bound not CPU-bound, so single-core costs ~nothing.
+            esper_set_online_cpus(static_cast<uint32_t>(frame[1]));
+            frame[0] = 0;
+            return;
+        }
         if (frame[0] == 15 /*PR_SET_NAME*/ && me != nullptr) {
             const uint64_t va = frame[1];
             // PR_SET_NAME's buffer is TASK_COMM_LEN (16) bytes; we validate and
@@ -4192,11 +4537,42 @@ void linux_syscall_dispatch(uint64_t *frame) {
         frame[0] = 0;
         return;
     }
-    case 51 /*chroot*/:
-        // Index doesn't enforce filesystem containment yet; sshd's privsep
-        // child chroots to /var/empty and aborts on failure, so accept.
+    case 51 /*chroot*/: {
+        // Real chroot: confine this process (and its fork/exec descendants) to a
+        // subtree. Used both by sshd's privsep child (-> /var/empty) and by the
+        // isolated package environment (`chroot /apt-debian apt ...`) so apt/dpkg
+        // can't touch the base system. resolve_path resolves UNDER the current
+        // root (nested chroot composes), prefixes every absolute path with the
+        // new root, and floors ".." at the root so the jail can't be escaped.
+        if (me == nullptr) { frame[0] = static_cast<uint64_t>(-1); return; } // -EPERM
+        if (me->euid != 0) { frame[0] = static_cast<uint64_t>(-1); return; } // -EPERM (CAP_SYS_CHROOT)
+        const uint64_t path_va = frame[0];
+        if (!ensure_user(me, path_va, 1)) { frame[0] = static_cast<uint64_t>(-14); return; }
+        char abs[kCwdCap]; // REAL path (already includes any current root)
+        if (!resolve_path(me, nullptr, reinterpret_cast<const char *>(path_va), abs, kCwdCap)) {
+            frame[0] = static_cast<uint64_t>(-2); return; // -ENOENT
+        }
+        const bool to_root = (abs[0] == '/' && abs[1] == 0);
+        if (!to_root && !lateran_is_dir(abs)) { frame[0] = static_cast<uint64_t>(-20); return; } // -ENOTDIR
+        if (to_root) {
+            me->root_dir[0] = 0; me->root_depth = 0;       // leave the jail
+            me->cwd[0] = '/'; me->cwd[1] = 0;
+        } else {
+            uint32_t i = 0;
+            for (; i + 1 < kCwdCap && abs[i] != 0; ++i) me->root_dir[i] = abs[i];
+            me->root_dir[i] = 0;
+            uint32_t d = 0; // component count of the new root (the ".." floor)
+            for (uint32_t k = 0; abs[k] != 0; ++k) {
+                if (abs[k] == '/' && abs[k + 1] != 0 && abs[k + 1] != '/') ++d;
+            }
+            me->root_depth = d;
+            // New root becomes cwd (stored REAL == root_dir); getcwd reports "/".
+            for (i = 0; i + 1 < kCwdCap && abs[i] != 0; ++i) me->cwd[i] = abs[i];
+            me->cwd[i] = 0;
+        }
         frame[0] = 0;
         return;
+    }
 
     default:
         // During bring-up, announce anything we haven't implemented so it's

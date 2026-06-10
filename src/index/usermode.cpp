@@ -432,7 +432,12 @@ struct ImageRef {
     uint8_t *img = nullptr;
     uint32_t refs = 0;
 };
-ImageRef g_image_refs[2 * kMaxEspers];
+// 4*kMaxEspers (not 2*): during execve a process transiently holds its OLD elf +
+// interp AND its freshly-allocated NEW elf + interp before the old pair is
+// unref'd, so a fleet of concurrent execs can reference up to ~4 buffers each.
+// Headroom keeps image_ref from silently failing to track (which, with the
+// untracked-unref now a no-op, would leak rather than corrupt).
+ImageRef g_image_refs[4 * kMaxEspers];
 
 void image_ref(uint8_t *img) {
     if (img == nullptr) return;
@@ -465,7 +470,16 @@ bool image_unref(uint8_t *img) {
         }
     }
     anti_skill_unlock_irqrestore(g_esper_lock, flags);
-    return true; // untracked (loaded before refcounting) -> free
+    // NOT in the table. The old code returned true here ("free it"), but a
+    // buffer is untracked only because image_ref's table (2*kMaxEspers) was full
+    // and it silently leaked the add, OR this is a second unref of an already-
+    // released buffer. Freeing in EITHER case is a use-after-free: live VMAs
+    // still demand-fault through this buffer's bytes (file_src), so a reuse of
+    // the freed heap block corrupts whatever file-backed page faults next -- the
+    // deterministic "RO .got/code page reads 0" wild-fault under heavy fork+exec.
+    // Never free an untracked image; at worst a genuinely pre-refcount buffer
+    // (init's, which never exits) leaks. Correctness over a non-existent leak.
+    return false;
 }
 
 // Address-space refcounting now lives in PersonalReality (personal_reality_v2):
@@ -612,28 +626,42 @@ bool load_linux_elf_into_slot(Esper *e, uint8_t *file, int64_t len) {
     // leaving the parent with a dangling pointer that turned into a real
     // double-free on the parent's next exec / exit. Manifested as "sh: out
     // of memory" after ~20-30 unames as the heap freelist corrupted.
+    // ★execve "point of no return" fix. The old code released the old address
+    // space (reality_unref) and interpreter image HERE, then reality_alloc()'d
+    // the new space -- so a pool-exhausted alloc (heavy fork+exec churn) stranded
+    // the process with mm==nullptr: it returned -errno to its now-FREED old text
+    // and wild-faulted (the deterministic "mm==null / no-VMA EL0 fault re-running
+    // old code" bug, reproduced on smp=1 AND smp=8). Build + commit the NEW space
+    // FIRST while holding the old; only release the old once the new is
+    // guaranteed, so an allocation failure leaves the process runnable on its
+    // intact old space (exec cleanly returns the error and the shell retries).
+    PersonalReality *old_mm = e->mm;
+    PersonalReality *new_mm = reality_alloc();
+    if (new_mm == nullptr) {
+        district::writeln("exec: address-space pool exhausted.");
+        return false; // old space still installed -- process survives
+    }
+    e->mm = new_mm;
+    if (!pr2_create_addr_space(e)) {
+        district::writeln("exec: pr2_create_addr_space failed.");
+        reality_unref(e);   // free the half-built new space
+        e->mm = old_mm;     // restore the still-live old space
+        return false;
+    }
+    // New space committed -- past the point of no return. Release the old
+    // interpreter image and the old address space now. (reality_unref operates on
+    // e->mm, so point it at the old space for the drop, then restore the new.
+    // A forked sibling sharing the interp image only sees image_unref drop a ref.)
     if (e->linux_interp_image != nullptr) {
         if (image_unref(e->linux_interp_image)) {
             dark_matter_free(e->linux_interp_image);
         }
         e->linux_interp_image = nullptr;
     }
-    // Tear down a prior Linux address space on this slot (exec replacing a Linux
-    // program): reality_unref drops this Esper's reference and frees the space if
-    // it was the last sharer. No-op for an Index legacy-pool Esper (null mm; the
-    // Komoe-fork-then-exec case).
-    reality_unref(e);
-
-    // A fresh, independent address space (PersonalReality) for the new program.
-    e->mm = reality_alloc();
-    if (e->mm == nullptr) {
-        district::writeln("exec: address-space pool exhausted.");
-        return false;
-    }
-    if (!pr2_create_addr_space(e)) {
-        district::writeln("exec: pr2_create_addr_space failed.");
-        reality_unref(e);
-        return false;
+    if (old_mm != nullptr) {
+        e->mm = old_mm;
+        reality_unref(e);   // drop the old space's ref (frees if last sharer)
+        e->mm = new_mm;
     }
     // (reality_alloc already set refs=1 -- this process owns its new space.)
 
@@ -652,7 +680,29 @@ bool load_linux_elf_into_slot(Esper *e, uint8_t *file, int64_t len) {
     uint64_t interp_base = 0;
     char interp_path[64];
     if (elf_interp_path(file, len, interp_path, sizeof(interp_path))) {
-        // Read the dynamic linker from its real PT_INTERP path (e.g.
+        // Resolve the PT_INTERP path THROUGH the chroot, exactly like every other
+        // path syscall. A chrooted binary (e.g. apt's /apt-debian = Ubuntu glibc
+        // 2.35) MUST load the dynamic linker from INSIDE the jail, not the base
+        // system's ld-linux (Debian glibc 2.43). Loading the wrong-version
+        // ld-linux lays out the thread's TLS with the WRONG sizeof(struct
+        // pthread) (2.43=0x740 vs 2.35=0x7c0) -> the jail's libc then reads
+        // struct pthread fields 0x80 below the TLS block -> SIGSEGV. dpkg crashed
+        // exactly here, in getrandom (ldr w2,[TP-0x7c0]). The shared libraries
+        // are already fine: ld-linux opens them via openat, which resolves through
+        // the chroot. read_named_file takes a REAL path (no chroot of its own),
+        // so we prepend e->root_dir here.
+        char rooted_interp[kCwdCap + 64];
+        const char *interp_load_path = interp_path;
+        if (e->root_dir[0] != '\0') {
+            uint32_t n = 0;
+            for (uint32_t i = 0; e->root_dir[i] != '\0' && n + 1 < sizeof(rooted_interp); ++i)
+                rooted_interp[n++] = e->root_dir[i];
+            for (uint32_t i = 0; interp_path[i] != '\0' && n + 1 < sizeof(rooted_interp); ++i)
+                rooted_interp[n++] = interp_path[i];
+            rooted_interp[n] = '\0';
+            interp_load_path = rooted_interp;
+        }
+        // Read the dynamic linker from its (chroot-resolved) PT_INTERP path (e.g.
         // /lib/ld-musl-aarch64.so.1 -- ext2 resolves it). Fall back to the
         // flat-FS name LD-MUSL.SO so the legacy FAT image still works.
         auto *itmp = static_cast<uint8_t *>(dark_matter_alloc(kElfReadCap));
@@ -660,7 +710,7 @@ bool load_linux_elf_into_slot(Esper *e, uint8_t *file, int64_t len) {
             district::writeln("exec: out of heap for interpreter.");
             return false;
         }
-        int64_t ilen = read_named_file(interp_path, reinterpret_cast<char *>(itmp), kElfReadCap);
+        int64_t ilen = read_named_file(interp_load_path, reinterpret_cast<char *>(itmp), kElfReadCap);
         if (ilen < 0) {
             ilen = read_named_file("LD-MUSL.SO", reinterpret_cast<char *>(itmp), kElfReadCap);
         }
@@ -1006,11 +1056,22 @@ void load_ctx(Esper *e, uint64_t *frame);
 // Both grab g_esper_lock: the wake flips state from waiting -> ready, and a
 // concurrent pick_and_claim on another CPU must see either the old state
 // (skip) or the new state with predicates cleared (claim atomically).
+extern volatile uint32_t g_poll_gen; // defined below; bumped here to close the
+                                     // ppoll/pselect check-then-park window.
+
 void wake_pipe_readers(int pipe_idx) {
     if (pipe_idx < 0) {
         return;
     }
     const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    // Publish "a producer fired" under the lock BEFORE scanning, exactly like
+    // ipc_wake_impl: a poller still in its pselect6/ppoll check-then-park window
+    // (already scanned, not yet parked) won't be found in `waiting` below, so the
+    // state=ready kick misses it -- but it rechecks poll_gen_changed under THIS
+    // same lock and re-scans instead of sleeping through the write. Without this
+    // bump, apt's http method parked in pselect6 on its command pipe never woke
+    // when apt-get wrote the "URI Acquire" -> apt-get update hung forever.
+    __atomic_add_fetch(&g_poll_gen, 1, __ATOMIC_RELAXED);
     for (uint32_t i = 0; i < kMaxEspers; ++i) {
         Esper *e = esper_at(i);
         if (e == nullptr || e->state != EsperState::waiting) continue;
@@ -1034,6 +1095,7 @@ void wake_pipe_writers(int pipe_idx) {
         return;
     }
     const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    __atomic_add_fetch(&g_poll_gen, 1, __ATOMIC_RELAXED); // close ppoll/pselect park window (see wake_pipe_readers)
     for (uint32_t i = 0; i < kMaxEspers; ++i) {
         Esper *e = esper_at(i);
         if (e == nullptr || e->state != EsperState::waiting) continue;
@@ -1160,6 +1222,9 @@ int linux_pipe2(Esper *e, int *out_fds, uint64_t /*flags*/) {
     e->fds[wfd] = Fd{};
     e->fds[wfd].kind = FdKind::pipe_write;
     e->fds[wfd].pipe_idx = pi;
+    e->fds[wfd].writable = true; // a pipe write end is writable: fcntl(F_GETFL)
+    // must report O_RDWR, else glibc fdopen(wfd,"w") (dpkg's status/script pipes)
+    // fails EINVAL ("Failed to open new FD - fdopen") and aborts `apt install`.
     out_fds[0] = rfd;
     out_fds[1] = wfd;
     return 0;
@@ -1232,10 +1297,15 @@ void linux_rt_sigsuspend(int idx, uint64_t *frame) {
     const uint64_t mask_size = frame[1];
     uint64_t new_mask = 0;
     if (mask_size >= 8 && mask_ptr != 0) {
-        // me is currently running on this CPU; its TTBR0 is the live address
-        // space, so the user-VA dereference is safe (matches how the rest of
-        // the syscall layer reads small user-mode buffers).
-        new_mask = *reinterpret_cast<const uint64_t *>(mask_ptr);
+        // Fault-safe read: a hostile/buggy mask_ptr (unmapped -> EL1 abort/crash;
+        // or a kernel high-half VA -> EL1 reads kernel memory) must not be trusted.
+        // The old raw `*reinterpret_cast` dereferenced it directly. pr2_read_user
+        // validates each byte through me's own page tables (returns false on any
+        // unmapped/unfaultable VA), turning a local DoS into a clean -EFAULT.
+        if (!pr2_read_user(me, mask_ptr, &new_mask, 8)) {
+            frame[0] = static_cast<uint64_t>(-14); // -EFAULT
+            return;
+        }
     }
     // SIGKILL/SIGSTOP must never be blocked.
     constexpr uint64_t kSigKillBit = 1ULL << (9 - 1);
@@ -1401,7 +1471,22 @@ bool linux_execve_replace(int idx, const char *path, const char *const *user_arg
                 uint32_t k = 0;
                 sb_argv[k++] = sb_interp;
                 if (an > 0) sb_argv[k++] = sb_arg;
-                sb_argv[k++] = path; // the script path itself
+                // The script path handed to the interpreter must be what the
+                // interpreter (which runs INSIDE any chroot) can open -- i.e. the
+                // chroot-relative path, not the host-resolved one. `path` is
+                // already root-prefixed (e.g. "/apt-debian/usr/bin/foo"); strip
+                // the chroot root so /bin/sh sees "/usr/bin/foo". Without this,
+                // dpkg's #!/bin/sh maintainer scripts (postinst/preinst/prerm)
+                // failed with "can't open '/apt-debian/...'" inside the apt chroot.
+                const char *script_rel = path;
+                if (e->root_dir[0] != 0) {
+                    uint32_t rl = 0; while (e->root_dir[rl] != 0) ++rl;
+                    bool pref = true;
+                    for (uint32_t i = 0; i < rl; ++i) if (path[i] != e->root_dir[i]) { pref = false; break; }
+                    // Component boundary: "/apt-debianX" must NOT match root "/apt-debian".
+                    if (pref && (path[rl] == '/' || path[rl] == 0)) { script_rel = path + rl; if (script_rel[0] == 0) script_rel = "/"; }
+                }
+                sb_argv[k++] = script_rel; // the script path itself (chroot-relative)
                 kbase = k; // [0,kbase) are kernel strings; the rest are user argv
                 for (uint32_t i = 1; i < argc && k < kExecArgvCap; ++i)
                     sb_argv[k++] = user_argv[i];
@@ -1540,13 +1625,20 @@ int64_t linux_file_write(Esper *e, uint32_t fd, const char *buf, uint64_t len) {
         !e->fds[fd].writable) {
         return -1;
     }
-    // Read-modify-write the whole (small) file: load current content, splice the
-    // new bytes at the fd's offset, write it all back to the FAT disk.
+    const uint64_t off = e->fds[fd].off;
+    if (len > 0xffffffffULL) len = 0xffffffffULL; // u32 chunk (callers write <=128K)
+    // Fast path: ext2 incremental write -- touches only the blocks at `off`, no
+    // whole-file rewrite, no RAM-buffer size cap. This is what makes large guest
+    // writes (apt .deb / dpkg-extracted binaries) practical instead of O(n^2).
+    const int64_t pw = lateran_pwrite(e->fds[fd].path, off, buf, static_cast<uint32_t>(len));
+    if (pw >= 0) { e->fds[fd].off += static_cast<uint64_t>(pw); return pw; }
+    if (pw != -2) return -1; // a real error (not "backend has no incremental path")
+    // Fallback (tmpfs / 9p / FAT): whole-file read-modify-write, capped at the
+    // RAM buffer. Splice the new bytes at the fd offset, write it all back.
     auto *tmp = static_cast<char *>(dark_matter_alloc(kElfReadCap));
     if (tmp == nullptr) return -1;
     int64_t cur = read_named_file(e->fds[fd].path, tmp, kElfReadCap);
     if (cur < 0) cur = 0;
-    const uint64_t off = e->fds[fd].off;
     if (off > kElfReadCap) { dark_matter_free(tmp); return -1; }
     if (off + len > kElfReadCap) len = kElfReadCap - off; // clamp to buffer
     for (uint64_t i = static_cast<uint64_t>(cur); i < off; ++i) tmp[i] = 0; // gap fill
@@ -1845,6 +1937,8 @@ int ipc_wake_impl(Esper::IpcWaitKind kind, int id) {
 // switch to its address space, then load its registers/SP/ELR/SPSR.
 void load_ctx(Esper *e, uint64_t *frame) {
     switch_ttbr0(e->ttbr0);
+    pr2_note_active_mm(e->mm); // this CPU is now executing in e's address space
+    esper_set_active_esper(esper_index(e)); // [HWEXEC] hardware-execution truth
     deliver_pending_status(e);
     asm volatile("msr tpidr_el0, %0" ::"r"(e->tpidr)); // per-thread TLS base
     if (e->started) {
@@ -1987,6 +2081,7 @@ void esper_preempt(uint64_t *frame) {
 
     Esper *n = esper_at(next);
     switch_ttbr0(n->ttbr0);
+    esper_set_active_esper(next); // [HWEXEC] hardware-execution truth
     deliver_pending_status(n);
     asm volatile("msr tpidr_el0, %0" ::"r"(n->tpidr)); // per-thread TLS base
     if (n->started) {
@@ -2063,7 +2158,27 @@ extern "C" void resume_user_elr_corrupt() {
 void run_one_esper(int next) {
     namespace district = imaginary_number_district;
     Esper *e = esper_at(static_cast<uint32_t>(next));
+    esper_set_active_esper(next); // [HWEXEC] hardware-execution truth (both branches eret into `next`)
     if (e->started) {
+        // [MMGUARD] A resumable (started) Esper MUST own a live address space.
+        // Under heavy fork/exec churn an Esper was observed resumed with
+        // mm==nullptr -- its PersonalReality was torn down (page table freed +
+        // zeroed) yet the Esper stayed schedulable, so the eret ran EL0 on a
+        // stale/freed ttbr0 whose L3 reads 0 -> translation fault at a "valid"
+        // VA (the [EL0 FAULT] mm==null / no-VMA signature). Catch it here:
+        // killing it cleanly stops the wild run; the log exposes the state the
+        // teardown left it in so the lifecycle race can be root-fixed.
+        if (e->abi == Abi::Linux && e->mm == nullptr) {
+            district::write("\n[MMGUARD] pid="); district::dec(e->pid);
+            district::write(" name "); district::write(e->name);
+            district::write(" state="); district::dec(static_cast<uint32_t>(e->state));
+            district::write(" ttbr0="); district::hex(e->ttbr0);
+            district::write(" elr="); district::hex(e->elr);
+            district::write(" parent="); district::dec(static_cast<uint32_t>(e->parent));
+            district::writeln(" resumed with mm==null -> killing (lifecycle race)");
+            kill_corrupt_esper(next, "");
+            return;
+        }
         // SPSR sanity check: M[4:0] == 0 means EL0t (only valid target).
         if ((e->spsr & 0x1F) != 0) {
             district::write("resume BAD SPSR=");
@@ -2391,6 +2506,7 @@ int64_t linux_pipe_write(int idx, uint32_t fd, const char *buf, uint64_t len,
             return -32; // -EPIPE
         }
         if (n == kAiwassWouldBlock) {
+            if (e->fds[fd].nonblock) return -11; // -EAGAIN: full, non-blocking fd
             if (park_on_pipe(idx, pi, /*is_write=*/true, frame)) {
                 return kFdParkedSentinel;
             }
@@ -2414,6 +2530,7 @@ int64_t linux_pipe_read(int idx, uint32_t fd, char *buf, uint64_t len,
             return 0; // EOF: writers all closed
         }
         if (n == kAiwassWouldBlock) {
+            if (e->fds[fd].nonblock) return -11; // -EAGAIN: empty, non-blocking fd
             if (park_on_pipe(idx, pi, /*is_write=*/false, frame)) {
                 return kFdParkedSentinel;
             }
@@ -2704,6 +2821,8 @@ void linux_clone(int idx, uint64_t *frame) {
     // (brk/mmap_next live in the shared PersonalReality `mm`: fork copies them in
     // pr2_fork; a CLONE_VM thread shares them automatically.)
     for (uint32_t i = 0; i < kCwdCap; ++i) c->cwd[i] = p->cwd[i]; // inherit cwd
+    for (uint32_t i = 0; i < kCwdCap; ++i) c->root_dir[i] = p->root_dir[i]; // inherit chroot jail
+    c->root_depth = p->root_depth;
     for (uint32_t i = 0; i < kCwdCap; ++i) c->exe_path[i] = p->exe_path[i]; // same image until execve
     c->uid = p->uid; c->euid = p->euid; c->suid = p->suid;
     c->gid = p->gid; c->egid = p->egid; c->sgid = p->sgid;
@@ -2831,6 +2950,11 @@ void linux_wait4(int idx, uint64_t *frame) {
     Esper *p = esper_at(static_cast<uint32_t>(idx));
     const uint64_t status_ptr = frame[1];
     const uint64_t options = frame[2];
+    // wait4 pid arg: >0 = a specific child, <=0 = any child (we don't model
+    // process groups, so 0/<-1 behave like -1 = any). Honoring >0 is required:
+    // dpkg-deb forks gzip+tar and subproc_wait()s each by exact pid, aborting if
+    // waitpid returns a different pid -- so reaping "any exited child" breaks it.
+    const int64_t wantpid = static_cast<int64_t>(frame[0]);
 
     // ptrace "Mental Out": report a ptrace-stopped tracee first (WSTOPPED status
     // (stopsig<<8)|0x7f). The tracee stays parked on PtraceStop -- NOT freed --
@@ -2876,6 +3000,7 @@ void linux_wait4(int idx, uint64_t *frame) {
     for (uint32_t i = 0; i < kMaxEspers; ++i) {
         Esper *cand = esper_at(i);
         if (cand != nullptr && cand->parent == idx &&
+            (wantpid <= 0 || cand->pid == static_cast<uint32_t>(wantpid)) &&
             (cand->state == EsperState::exited ||
              cand->state == EsperState::faulted)) {
             cpid = cand->pid;
@@ -2922,7 +3047,19 @@ void linux_wait4(int idx, uint64_t *frame) {
             has_tracee = true; break;
         }
     }
-    if (esper_child_count(idx) == 0 && !has_tracee) {
+    // For a specific pid (>0), ECHILD unless that exact pid is a live child of
+    // ours (its zombie form was already handled by the filtered reap above).
+    bool target_alive = false;
+    if (wantpid > 0) {
+        for (uint32_t i = 0; i < kMaxEspers; ++i) {
+            Esper *c = esper_at(i);
+            if (c != nullptr && c->parent == idx && c->pid == static_cast<uint32_t>(wantpid) &&
+                c->state != EsperState::free) { target_alive = true; break; }
+        }
+    }
+    const bool no_target = (wantpid > 0) ? !target_alive
+                                         : (esper_child_count(idx) == 0);
+    if (no_target && !has_tracee) {
         anti_skill_unlock_irqrestore(g_esper_lock, flags);
         frame[0] = static_cast<uint64_t>(-10); // -ECHILD
         return;
@@ -2949,6 +3086,7 @@ void linux_wait4(int idx, uint64_t *frame) {
     save_ctx(p, frame);
     p->wait_status_ptr = status_ptr;
     p->wait_status_is_linux = true; // encode as Linux wait status on delivery
+    p->wait4_target_pid = static_cast<int32_t>(wantpid); // only the matching child wakes us
     // Park as a GENERIC wait4 waiter so a child's exit takes the REAP branch in
     // maybe_wake_parent (parent_is_in_wait4_locked). That predicate requires
     // ipc_wait_kind==None && wait_pipe_idx<0 && !wait_futex && wake_cntpct==0;
@@ -3426,13 +3564,44 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
                     // Routing through the mm-group teardown wakes that waiter.
                     if (nr == 94 /*exit_group*/ && self != nullptr && self->mm != nullptr) {
                         PersonalReality *gmm = self->mm;
-                        const int next = esper_group_exit_and_pick(
-                            idx, static_cast<const void *>(gmm),
-                            static_cast<int64_t>(frame[0]));
+                        // Drop pipe refs for the whole dying mm-group BEFORE the
+                        // group-exit. esper_group_exit_and_pick -> maybe_wake_parent_locked
+                        // AUTO-REAPS (state=free) any member whose parent is parked in
+                        // wait4; a freed slot is then skipped by the "state==exited"
+                        // cleanup loop below, so its pipe write-end ref is never dropped.
+                        // A reader on the other half of a shell pipeline (`echo | cat`)
+                        // then never sees EOF and hangs forever -- the deterministic
+                        // single-core pipe hang. Pipes don't affect the mm match the
+                        // group-exit needs, so releasing them up front is safe (the
+                        // image is still released post-exit for the survivors).
                         for (uint32_t i = 0; i < kMaxEspers; ++i) {
                             Esper *o = esper_at(i);
                             if (o != nullptr && o->mm == gmm &&
-                                o->state == EsperState::exited) {
+                                o->state != EsperState::free &&
+                                o->state != EsperState::exited &&
+                                o->state != EsperState::faulted) {
+                                release_esper_pipes(o);
+                            }
+                        }
+                        const int next = esper_group_exit_and_pick(
+                            idx, static_cast<const void *>(gmm),
+                            static_cast<int64_t>(frame[0]));
+                        // Release the address space + ELF images of EVERY member
+                        // still on this mm. The old guard (state==exited) leaked
+                        // them: esper_group_exit_and_pick AUTO-REAPS a member whose
+                        // parent is parked in wait4 (state -> free, NOT exited), so
+                        // its release_linux_image never ran -> its reality slot +
+                        // image buffer leaked on EVERY process exit reaped that way
+                        // (a `/bin/true` loop exhausted the 128 mm pool + heap in
+                        // ~128 iterations). Gate on `o->mm == gmm` instead: a
+                        // never-used slot has mm==nullptr and a slot already reused
+                        // by a new process has mm!=gmm, so only genuine dying
+                        // members match. release_linux_image / release_esper_pipes
+                        // are idempotent (reality_unref no-ops once o->mm is null),
+                        // so the pre-released actives are safe to revisit.
+                        for (uint32_t i = 0; i < kMaxEspers; ++i) {
+                            Esper *o = esper_at(i);
+                            if (o != nullptr && o->mm == gmm) {
                                 release_esper_pipes(o);
                                 release_linux_image(o); // reality_unref(clears mm)+unref
                             }
@@ -3620,9 +3789,11 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
             Esper *p = esper_at(idx);
             save_ctx(p, frame);
             p->wait_status_ptr = status_ptr;
-            const int next = esper_park_and_pick(idx);
+            const int next = esper_park_and_pick_keep(idx);
             if (next < 0) {
-                esper_set_running(idx); // nothing runnable; unpark and give up
+                // Nothing else runnable: esper_park_and_pick_keep already un-parked
+                // us (still running on this cpu, atomically -- no window for a
+                // child-exit wake to double-schedule us). Give up the wait.
                 frame[0] = static_cast<uint64_t>(-1);
                 return;
             }
@@ -3781,6 +3952,7 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
             e->fds[wfd] = Fd{};
             e->fds[wfd].kind = FdKind::pipe_write;
             e->fds[wfd].pipe_idx = pi;
+            e->fds[wfd].writable = true; // write end is writable (fdopen(,"w"))
             out[0] = rfd;
             out[1] = wfd;
             frame[0] = 0;
@@ -3941,6 +4113,27 @@ extern "C" void el0_sync_dispatch(uint64_t esr, uint64_t *frame) {
             district::dec(bad->pid);
             district::write(" name ");
             district::write(bad->name);
+            district::write(" abi="); district::dec(static_cast<uint32_t>(bad->abi));
+            district::write(" started="); district::dec(bad->started ? 1u : 0u);
+            district::write(" mmnull="); district::dec(bad->mm == nullptr ? 1u : 0u);
+            district::write(" x30="); district::hex(bad->regs[30]);
+            district::write(" x29="); district::hex(bad->regs[29]);
+            district::write(" x0="); district::hex(bad->regs[0]);
+            district::write(" sp="); district::hex(bad->sp_el0);
+            // [TTBRDIAG] The FAULTLOOP signature (valid L3 in e->ttbr0 but the
+            // fetch keeps translation-faulting) means the CPU's ACTIVE TTBR0 isn't
+            // the one pr2_handle_fault maps into. Dump both: a mismatch is the root
+            // (apt runs on a stale/foreign page table -> its real pages look
+            // unmapped -> infinite demand-fault on a legit PLT call).
+            {
+                uint64_t cpu_ttbr0 = 0; asm volatile("mrs %0, ttbr0_el1" : "=r"(cpu_ttbr0));
+                district::write(" TTBR0cpu="); district::hex(cpu_ttbr0 & 0x0000FFFFFFFFF000ULL);
+                district::write(" e->ttbr0="); district::hex(bad->ttbr0);
+                if (bad->mm != nullptr) { district::write(" mm->ttbr0="); district::hex(bad->mm->ttbr0); }
+                if ((cpu_ttbr0 & 0x0000FFFFFFFFF000ULL) != (bad->ttbr0 & 0x0000FFFFFFFFF000ULL)) {
+                    district::write(" TTBR0-MISMATCH!");
+                }
+            }
             // [gap12 diag] regs at fault: x30(LR)==ELR ⇒ ret to a smashed return
             // address (stack wild-write); else a bad branch register. Localizes
             // the HVF-SMP clone-thread wild-write source.

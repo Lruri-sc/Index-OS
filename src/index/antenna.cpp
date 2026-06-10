@@ -1,6 +1,7 @@
 #include "index/antenna.hpp"
 
 #include "drivers/misaka_mail.hpp"
+#include "index/dns.hpp" // dns_resolve (kernel DNS proxy for userspace getaddrinfo)
 #include "index/esper.hpp"
 #include "index/imaginary_number_district.hpp"
 #include "index/last_order.hpp"
@@ -13,6 +14,16 @@ namespace district = index::imaginary_number_district;
 namespace {
 
 Antenna g_ants[kMaxAntennas];
+// rx_buf lives OUT of the Antenna struct: a per-socket ring kept here in BSS and
+// indexed by the antenna's slot. This keeps sizeof(Antenna) tiny so the four
+// `g_ants[i] = Antenna{}` / `child = Antenna{}` resets don't materialise a whole
+// rx_buf-sized temporary on the stack -- a 64 KB rx_buf there overflowed the
+// secondary stack ([STACKGUARD] secondary cpu 1). With the ring out here we can
+// also size the receive window large (anti-collapse for slow, write-bound apt
+// reads) without any stack cost. Reset only zeroes rx_head/tail/avail (in the
+// struct), which empties the ring -- the stale bytes here are then never read.
+uint8_t g_rx_bufs[kMaxAntennas][kAntennaRxBytes];
+static inline uint8_t *rxbuf(Antenna &a) { return g_rx_bufs[&a - g_ants]; }
 uint16_t g_ephemeral = 49152;
 
 bool valid(int idx) {
@@ -62,13 +73,13 @@ inline void rx_avail_sub(Antenna &a, uint32_t n) {
 }
 
 void rx_put(Antenna &a, uint8_t b) {
-    a.rx_buf[a.rx_tail] = b;
+    rxbuf(a)[a.rx_tail] = b;
     a.rx_tail = (a.rx_tail + 1) % kAntennaRxBytes;
     rx_avail_add(a, 1);
 }
 
 uint8_t rx_get(Antenna &a) {
-    const uint8_t b = a.rx_buf[a.rx_head];
+    const uint8_t b = rxbuf(a)[a.rx_head];
     a.rx_head = (a.rx_head + 1) % kAntennaRxBytes;
     rx_avail_sub(a, 1);
     return b;
@@ -126,6 +137,69 @@ bool antenna_connect(int idx, const uint8_t ip[4], uint16_t port) {
     return true;
 }
 
+// ★ Kernel-side DNS proxy. When a UDP socket sends a query to :53, resolve the
+// name with the KERNEL resolver (dns_resolve, which gets its reply via
+// net_rx_poll's yield-spin -- the RX path that actually works on HVF) and
+// synthesize the DNS response straight into the querying socket's rx ring. This
+// sidesteps the userspace DNS dead-end: ppoll deliberately never drains the NIC
+// (it would re-enter deliver_tcp on the poller's stack and race SSH KEX), and a
+// single virtio RX doorbell kick per tick does NOT make HVF hand over a one-shot
+// UDP reply -- so musl getaddrinfo's poll/recvfrom never saw the answer and timed
+// out (EAI_AGAIN). With this, name resolution works for any program and apt can
+// hit real internet mirrors instead of a raw-IP host repo.
+// Guard so dns_resolve()'s OWN query to :53 (it calls antenna_sendto) does not
+// re-enter this proxy -> infinite recursion until the socket pool is exhausted.
+static bool g_dns_resolving = false;
+
+static bool dns_proxy_try(Antenna &a, const uint8_t *q, uint32_t qlen) {
+    if (qlen < 17 || q == nullptr) return false; // 12 hdr + >=1 label + null + qtype/qclass
+    if (q[4] != 0 || q[5] != 1) return false;    // qdcount must be 1
+    char name[256];
+    uint32_t p = 12, n = 0;
+    while (p < qlen && q[p] != 0) {
+        uint32_t lab = q[p++];
+        if (lab > 63 || p + lab > qlen || n + lab + 1 >= sizeof name) return false;
+        if (n != 0) name[n++] = '.';
+        for (uint32_t i = 0; i < lab; ++i) name[n++] = static_cast<char>(q[p++]);
+    }
+    name[n] = 0;
+    if (p >= qlen) return false;
+    p++; // skip root label
+    if (p + 4 > qlen) return false;
+    const uint16_t qtype = static_cast<uint16_t>((q[p] << 8) | q[p + 1]);
+    const uint32_t qsec_end = p + 4; // end of question (qname + qtype + qclass)
+
+    uint8_t resp[600];
+    uint32_t r = 0;
+    uint8_t rcode = 0, ancount = 0, ip[4] = {};
+    if (qtype == 1 /*A*/) {
+        g_dns_resolving = true;
+        const bool ok = dns_resolve(name, ip);
+        g_dns_resolving = false;
+        if (ok) ancount = 1;
+        else rcode = 2; // SERVFAIL -> getaddrinfo EAI_AGAIN (real lookup failed)
+    } // AAAA(28)/other: NOERROR with 0 answers so getaddrinfo falls back to the A
+    resp[r++] = q[0]; resp[r++] = q[1];                 // echo transaction ID
+    resp[r++] = 0x81;                                   // QR=1, RD=1
+    resp[r++] = static_cast<uint8_t>(0x80 | rcode);     // RA=1, rcode
+    resp[r++] = 0; resp[r++] = 1;                       // qdcount=1
+    resp[r++] = 0; resp[r++] = ancount;                 // ancount
+    resp[r++] = 0; resp[r++] = 0;                       // nscount
+    resp[r++] = 0; resp[r++] = 0;                       // arcount
+    for (uint32_t i = 12; i < qsec_end && r < sizeof resp; ++i) resp[r++] = q[i]; // echo question
+    if (ancount == 1) {
+        resp[r++] = 0xC0; resp[r++] = 0x0C;            // name = compression ptr -> qname @12
+        resp[r++] = 0; resp[r++] = 1;                  // type A
+        resp[r++] = 0; resp[r++] = 1;                  // class IN
+        resp[r++] = 0; resp[r++] = 0; resp[r++] = 0x01; resp[r++] = 0x2C; // ttl 300s
+        resp[r++] = 0; resp[r++] = 4;                  // rdlength
+        resp[r++] = ip[0]; resp[r++] = ip[1]; resp[r++] = ip[2]; resp[r++] = ip[3];
+    }
+    const uint8_t dns_src[4] = {10, 0, 2, 3}; // appear to come from the SLIRP resolver
+    antenna_deliver_udp(dns_src, 53, a.local_port, resp, r);
+    return true;
+}
+
 int64_t antenna_sendto(int idx, const uint8_t *dst_ip, uint16_t dst_port,
                        const uint8_t *buf, uint32_t len) {
     if (!valid(idx)) return -9; // -EBADF
@@ -138,6 +212,9 @@ int64_t antenna_sendto(int idx, const uint8_t *dst_ip, uint16_t dst_port,
         a.local_port = next_ephemeral(); // implicit bind
         if (a.local_port == 0) return -98; // -EADDRINUSE
     }
+    // Intercept DNS: resolve in-kernel and deliver the reply to our own ring.
+    // Skip when we're inside dns_resolve's own send (else infinite recursion).
+    if (port == 53 && !g_dns_resolving && dns_proxy_try(a, buf, len)) return static_cast<int64_t>(len);
     if (!drivers::misaka_mail_send_udp(ip, a.local_port, port, buf, len)) {
         return -101; // -ENETUNREACH
     }
@@ -145,7 +222,7 @@ int64_t antenna_sendto(int idx, const uint8_t *dst_ip, uint16_t dst_port,
 }
 
 int64_t antenna_recvfrom(int idx, uint8_t *buf, uint32_t cap, uint8_t *src_ip,
-                         uint16_t *src_port, uint32_t timeout_ticks) {
+                         uint16_t *src_port, uint32_t timeout_ticks, bool nonblock) {
     if (!valid(idx)) return -9;
     Antenna &a = g_ants[idx];
 
@@ -153,9 +230,22 @@ int64_t antenna_recvfrom(int idx, uint8_t *buf, uint32_t cap, uint8_t *src_ip,
     // the budget runs out. handle_inbound() calls antenna_deliver_udp which
     // pushes into a.rx_buf.
     if (rx_avail_load(a) == 0) {
-        drivers::misaka_mail_pump(timeout_ticks);
+        // First do a NON-blocking drain so an already-arrived datagram is picked
+        // up even on a non-blocking socket.
+        drivers::misaka_mail_drain();
+        if (rx_avail_load(a) == 0) {
+            // ★ Honour O_NONBLOCK / MSG_DONTWAIT: return -EAGAIN immediately
+            // instead of pumping for ~10 s. musl's getaddrinfo (res_msend) drains
+            // its DNS socket with `while (recvfrom() >= 0)` on a SOCK_NONBLOCK
+            // socket and expects -EAGAIN on the empty follow-up read; the old
+            // unconditional block stalled that loop and DNS failed (EAI_AGAIN), so
+            // apt could only reach a raw-IP repo. With this, name resolution works
+            // and apt can hit real internet mirrors.
+            if (nonblock) return -11; // -EAGAIN
+            drivers::misaka_mail_pump(timeout_ticks);
+        }
     }
-    if (rx_avail_load(a) == 0) return 0; // timed out / would block
+    if (rx_avail_load(a) == 0) return nonblock ? -11 : 0; // timed out / would block
 
     // Decode a datagram header: src_ip(4) src_port(2) len(2).
     uint8_t hdr[8];
@@ -213,6 +303,14 @@ uint32_t antenna_poll(int idx) {
         re |= 0x4; // UDP always writable
     }
     return re;
+}
+
+// True iff this socket is a UDP socket. recvmsg() needs it to pick the datagram
+// recv path (antenna_recvfrom) instead of the TCP stream path -- musl getaddrinfo
+// recvmsg's its UDP DNS socket, and the TCP path returns -EBADF for UDP, so DNS
+// never resolved (apt couldn't use real mirrors).
+bool antenna_is_udp(int idx) {
+    return valid(idx) && g_ants[idx].proto == AntennaProto::Udp;
 }
 
 // Atomic CAS dec-if-positive (refcount_t style); returns the new value. refs is
@@ -305,14 +403,23 @@ uint64_t read_cntfrq() {
     return f;
 }
 
-void rx_bytes_put(Antenna &a, const uint8_t *src, uint32_t n) {
+// Store up to `n` bytes into the rx ring; returns the count ACTUALLY stored
+// (less than n if the ring is near-full). Callers MUST advance rcv_nxt by the
+// RETURN value, never by the full segment length: ACKing bytes we dropped makes
+// the peer think they arrived, so it never retransmits them -> a permanent hole.
+// This is exactly what stalled apt-get update at 97% -- as apt drained slowly the
+// ring filled, a segment got truncated here, but rcv_nxt was bumped by the full
+// length, so the dropped tail of InRelease was never resent.
+uint32_t rx_bytes_put(Antenna &a, const uint8_t *src, uint32_t n) {
     const uint32_t free = kAntennaRxBytes - rx_avail_load(a);
-    if (n > free) n = free; // drop overflow (TCP would shrink window)
+    if (n > free) n = free; // ring full: accept a prefix; peer resends the rest
+    uint8_t *rb = rxbuf(a);
     for (uint32_t i = 0; i < n; ++i) {
-        a.rx_buf[a.rx_tail] = src[i];
+        rb[a.rx_tail] = src[i];
         a.rx_tail = (a.rx_tail + 1) % kAntennaRxBytes;
     }
     rx_avail_add(a, n); // RELEASE: publishes the rx_buf writes above to consumers
+    return n;
 }
 
 // Walk the OOO slots looking for one whose seq == rcv_nxt, drain it into the
@@ -324,9 +431,13 @@ void tcp_drain_ooo(Antenna &a) {
         progress = false;
         for (uint32_t k = 0; k < kAntennaOooSlots; ++k) {
             OooSeg &s = a.ooo[k];
-            if (s.len > 0 && s.seq == a.rcv_nxt) {
-                rx_bytes_put(a, s.data, s.len);
-                a.rcv_nxt += s.len;
+            // Only drain an OOO segment if it fits WHOLE: a partial drain would
+            // advance rcv_nxt past data we didn't store (the rx_bytes_put fix
+            // returns the stored count, but here we need all-or-nothing so the
+            // slot stays intact for a later retry once apt frees ring space).
+            if (s.len > 0 && s.seq == a.rcv_nxt &&
+                (kAntennaRxBytes - rx_avail_load(a)) >= s.len) {
+                a.rcv_nxt += rx_bytes_put(a, s.data, s.len);
                 s.len = 0;
                 progress = true;
             }
@@ -356,13 +467,38 @@ void tcp_park_ooo(Antenna &a, uint32_t seq, const uint8_t *payload, uint32_t ple
 }
 
 void tcp_send_seg(Antenna &a, uint8_t flags, const uint8_t *payload, uint32_t plen) {
+    const uint16_t win = antenna_rcv_window(a);
+    a.last_adv_win = win; // remember what the peer now believes our window is
     drivers::misaka_mail_send_tcp(a.remote_ip, a.local_port, a.remote_port,
-                                  flags, a.snd_nxt, a.rcv_nxt,
-                                  antenna_rcv_window(a), payload, plen);
+                                  flags, a.snd_nxt, a.rcv_nxt, win, payload, plen);
 }
 
 void tcp_send_ack(Antenna &a) {
     tcp_send_seg(a, kTcpAck, nullptr, 0);
+}
+
+// Window-update ACK after a recv drained `n` bytes (`avail_before` = ring fill
+// BEFORE the drain). When the rx ring fills, antenna_rcv_window advertises a tiny
+// (or zero) window and the peer stops sending; once the app drains the ring the
+// peer must be told the window reopened. We had NO such ACK -- so apt-get update
+// stalled at 97%: the ring filled (window ~0), apt drained it, but the server was
+// never told and never sent the rest of InRelease. Fire when the free window rises
+// from below one MSS to >= one MSS (RFC 1122 window-update / SWS avoidance).
+void tcp_window_update_ack(Antenna &a, uint32_t avail_before, uint32_t n) {
+    if (n == 0) return;
+    (void)avail_before;
+    constexpr uint32_t kMss = 1460;
+    // RFC 1122 window-update / SWS avoidance: after the app drains the ring, tell
+    // the peer whenever the receive window has reopened by >= 1 MSS since we last
+    // advertised it. The old check only fired when the window rose from BELOW one
+    // MSS, so a peer that stopped with a few-KB window (which happens under apt's
+    // bursty O_NONBLOCK reads -- no arrival-ACKs while the peer is window-stalled)
+    // never got told the window reopened and stalled forever (the 261KB apt hang).
+    // A blocking reader (wget) emits continuous arrival-ACKs and never hit this.
+    const uint32_t cur_free = kAntennaRxBytes - rx_avail_load(a);
+    if (cur_free >= a.last_adv_win + kMss) {
+        tcp_send_ack(a); // tcp_send_seg refreshes last_adv_win to cur_free
+    }
 }
 
 void tcp_stage_retransmit(Antenna &a, uint32_t seq, const uint8_t *payload, uint32_t plen) {
@@ -524,10 +660,11 @@ int64_t antenna_tcp_try_recv(int idx, uint8_t *buf, uint32_t cap, bool *peer_gon
     if (avail == 0) return 0;
     uint32_t n = cap; if (n > avail) n = avail;
     for (uint32_t i = 0; i < n; ++i) {
-        buf[i] = a.rx_buf[a.rx_head];
+        buf[i] = rxbuf(a)[a.rx_head];
         a.rx_head = (a.rx_head + 1) % kAntennaRxBytes;
     }
     rx_avail_sub(a, n);
+    tcp_window_update_ack(a, avail, n);
     return static_cast<int64_t>(n);
 }
 
@@ -545,10 +682,11 @@ int64_t antenna_tcp_recv(int idx, uint8_t *buf, uint32_t cap, uint32_t timeout_t
     uint32_t n = cap;
     if (n > avail) n = avail;
     for (uint32_t i = 0; i < n; ++i) {
-        buf[i] = a.rx_buf[a.rx_head];
+        buf[i] = rxbuf(a)[a.rx_head];
         a.rx_head = (a.rx_head + 1) % kAntennaRxBytes;
     }
     rx_avail_sub(a, n);
+    tcp_window_update_ack(a, avail, n);
     return static_cast<int64_t>(n);
 }
 
@@ -757,8 +895,7 @@ bool antenna_deliver_tcp(const uint8_t src_ip[4], uint16_t src_port,
             a.tcp_state = TcpState::Established;
             // If the client coalesced data with the ACK, deliver it now.
             if (plen > 0 && seq == a.rcv_nxt) {
-                rx_bytes_put(a, payload, plen);
-                a.rcv_nxt += plen;
+                a.rcv_nxt += rx_bytes_put(a, payload, plen); // by stored count, not plen
                 tcp_send_ack(a);
             }
             // Wake any Esper parked on the listen socket waiting for accept.
@@ -804,11 +941,17 @@ bool antenna_deliver_tcp(const uint8_t src_ip[4], uint16_t src_port,
         bool delivered_data = false;
         if (plen > 0) {
             if (seq == a.rcv_nxt) {
-                rx_bytes_put(a, payload, plen);
-                a.rcv_nxt += plen;
+                // Advance rcv_nxt only by what actually fit in the ring (got),
+                // never by plen: if the ring was near-full and rx_bytes_put
+                // truncated, ACKing the dropped tail (rcv_nxt += plen) made the
+                // peer believe it arrived -> it never resent it -> apt-get update
+                // hung at 97% on the lost tail of InRelease. Now the peer resends
+                // [seq+got, seq+plen) once apt drains the ring.
+                const uint32_t got = rx_bytes_put(a, payload, plen);
+                a.rcv_nxt += got;
                 tcp_drain_ooo(a);
                 tcp_send_ack(a);
-                delivered_data = true;
+                delivered_data = (got > 0);
             } else if (seq > a.rcv_nxt) {
                 tcp_park_ooo(a, seq, payload, plen);
                 tcp_send_ack(a); // duplicate ACK signals the hole
@@ -867,10 +1010,21 @@ bool antenna_deliver_tcp(const uint8_t src_ip[4], uint16_t src_port,
 bool antenna_has_active_socket() {
     for (uint32_t i = 0; i < kMaxAntennas; ++i) {
         const Antenna &a = g_ants[i];
-        if (a.proto != AntennaProto::Tcp) continue;
-        const TcpState s = a.tcp_state;
-        if (s != TcpState::Closed && s != TcpState::Listen &&
-            s != TcpState::TimeWait && s != TcpState::Reset) {
+        if (a.proto == AntennaProto::Tcp) {
+            const TcpState s = a.tcp_state;
+            if (s != TcpState::Closed && s != TcpState::Listen &&
+                s != TcpState::TimeWait && s != TcpState::Reset) {
+                return true;
+            }
+        } else if (a.proto == AntennaProto::Udp && a.local_port != 0) {
+            // ★ A UDP socket that has bound/sent may be awaiting a reply -- most
+            // importantly a DNS query (musl getaddrinfo). network_tick uses this to
+            // decide whether to re-ring the virtio-net RX doorbell; without UDP
+            // here, SLIRP-buffered DNS *responses* never get delivered into the RX
+            // ring (the reply IS on the wire -- pcap confirms -- but qemu needs a
+            // vm-exit to hand it over), so musl's poll times out -> EAI_AGAIN and
+            // apt can only reach a raw-IP repo. Kicking for open UDP sockets too
+            // makes name resolution work end to end.
             return true;
         }
     }

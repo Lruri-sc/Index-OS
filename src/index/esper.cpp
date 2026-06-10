@@ -28,6 +28,14 @@ uint32_t g_next_pid = 1;
 // Initialised to -1 (= no Esper running) because the slot 0 is a valid
 // Esper index, not a sentinel.
 int g_running[kMaxCpus] = {-1, -1, -1, -1, -1, -1, -1, -1};
+// [HWEXEC] The HARDWARE truth: which Esper each CPU is *actually executing* now.
+// Unlike g_running (the scheduler's claim, which group-exit/park clear EARLY --
+// before the core reschedules off it), this is set when a core truly resumes an
+// Esper to EL0 and cleared only when it truly leaves (leave_user). It stops
+// esper_create from recycling a slot a core is still running -- the smp=8 root
+// (GEV timeline: pid17's slot reused as pid18 while cpu4 still ran pid17 -> cpu4
+// runs pid18's mm against pid17's loaded TTBR0 -> FAULTLOOP). gev_log proved it.
+int g_cpu_active_esper[kMaxCpus] = {-1, -1, -1, -1, -1, -1, -1, -1};
 
 // Number of online CPUs participating in EL0 scheduling (set by
 // misaka_network once secondaries are up). 1 until then.
@@ -64,20 +72,42 @@ const char *state_name(EsperState s) {
 
 } // namespace
 
+// [HWEXEC] A slot is "in use" if ANY CPU still references it -- the scheduler
+// claim (g_running, set at pick) OR the hardware-execution truth
+// (g_cpu_active_esper, set at the actual eret, cleared only at leave_user).
+// g_running can be left STALE: when a thread is group-exited/reaped on core F,
+// clear_running_slot only clears core F's own slot, so a sibling still executing
+// on core X keeps g_running[X] pointing at it until X reschedules. Reusing such a
+// slot (free OR exited) hands the new program a new mm while core X runs the old
+// one on the old TTBR0 -> the smp=8 FAULTLOOP (GEV-confirmed: pid17's slot reused
+// as pid18 while a core still ran pid17). MUST gate BOTH the free-slot AND the
+// recycle loop -- a reaped (state=free) slot still held by a stale g_running was
+// the hole the recycle-only gate missed.
+static bool slot_in_use_locked(uint32_t i) {
+    for (uint32_t c = 0; c < kMaxCpus; ++c) {
+        if (g_running[c] == static_cast<int>(i) ||
+            g_cpu_active_esper[c] == static_cast<int>(i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int esper_create(const char *name) {
     const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
     int slot = -1;
     for (uint32_t i = 0; i < kMaxEspers; ++i) {
-        if (g_espers[i].state == EsperState::free) {
+        if (g_espers[i].state == EsperState::free && !slot_in_use_locked(i)) {
             slot = static_cast<int>(i);
             break;
         }
     }
     if (slot < 0) {
-        // Recycle the lowest-pid finished process.
+        // Recycle the lowest-pid finished process (gated the same way).
         for (uint32_t i = 0; i < kMaxEspers; ++i) {
             if (g_espers[i].state == EsperState::exited ||
                 g_espers[i].state == EsperState::faulted) {
+                if (slot_in_use_locked(i)) continue;
                 if (slot < 0 || g_espers[i].pid < g_espers[slot].pid) {
                     slot = static_cast<int>(i);
                 }
@@ -164,6 +194,25 @@ int esper_running_on(uint32_t cpu) {
     return cpu < kMaxCpus ? g_running[cpu] : -1;
 }
 
+// [HWEXEC] Set/clear the hardware-execution truth (see g_cpu_active_esper). A
+// core calls set right before it eret's into an Esper, and clear when it leaves
+// user mode (no lock needed: each CPU only writes its own slot, reads are racy-
+// safe single words; esper_create reads them under g_esper_lock).
+void esper_set_active_esper(int idx) {
+    const uint32_t cpu = arch::this_cpu_id();
+    if (cpu < kMaxCpus) g_cpu_active_esper[cpu] = idx;
+}
+void esper_clear_active_esper() {
+    const uint32_t cpu = arch::this_cpu_id();
+    if (cpu < kMaxCpus) g_cpu_active_esper[cpu] = -1;
+}
+// Index of an Esper in the table (for callers holding only the pointer).
+int esper_index(const Esper *e) {
+    if (e == nullptr) return -1;
+    const long d = e - g_espers;
+    return (d >= 0 && d < static_cast<long>(kMaxEspers)) ? static_cast<int>(d) : -1;
+}
+
 // Wake the secondary CPUs (reschedule IPI) so they re-scan for runnable
 // Espers. Called after an Esper becomes ready (clone, IPC wake, child-exit
 // parent wake, ...) so a parked secondary picks it up promptly instead of
@@ -218,11 +267,33 @@ void wake_sleepers_locked() {
 // resurrects itself -- so an idle secondary finds nothing and WFIs. Boot
 // core handles all timer-based wakeups centrally (its 100 Hz preempt +
 // run_espers loop both run wake_sleepers).
+// True if Esper `idx` already occupies some CPU's run slot. A scheduler pick must
+// never claim such an Esper even if its state reads `ready`: a stale/duplicate
+// wake can mark a still-running Esper ready, and claiming it on a second CPU
+// double-schedules it -- two cores then execute the same context/stack/mm and
+// corrupt each other (the apt smp=8 "wild jump", confirmed via [RUNSLOTS]: one
+// Esper idx on two CPUs at once). The owning CPU keeps it; it becomes truly
+// claimable only once that CPU preempts/blocks it (which clears its run slot).
+bool running_somewhere_locked(int idx) {
+    for (uint32_t c = 0; c < kMaxCpus; ++c) {
+        if (g_running[c] == idx) return true;
+    }
+    return false;
+}
+
 int pick_and_claim_locked(int after) {
+    // EL0 core cap: a core whose id is at/above g_online_cpus picks nothing and
+    // idles (cpu 0 always passes -- the cap is >= 1). The apt wrapper drops the
+    // cap to 1 (PR_INDEX_SET_CPUS) around a real-mirror download so the whole job
+    // runs single-core -- smp=1 is 100% stable, dodging the deep-SMP large-
+    // download "zeroed-context" crash -- then restores it. Active cores drain
+    // here on their next pick (preempt/park/exit all route through this); the -1
+    // return is the well-worn "nothing runnable -> idle" path.
+    if (arch::this_cpu_id() >= g_online_cpus) return -1;
     if (arch::this_cpu_id() == 0) wake_sleepers_locked();
     for (uint32_t step = 1; step <= kMaxEspers; ++step) {
         const int idx = static_cast<int>((after + step) % kMaxEspers);
-        if (g_espers[idx].state == EsperState::ready) {
+        if (g_espers[idx].state == EsperState::ready && !running_somewhere_locked(idx)) {
             g_espers[idx].state = EsperState::running;
             const uint32_t cpu = arch::this_cpu_id();
             if (cpu < kMaxCpus) g_running[cpu] = idx;
@@ -262,11 +333,18 @@ void maybe_wake_parent_locked(Esper &me) {
     }
     Esper &p = g_espers[parent_idx];
     if (parent_is_in_wait4_locked(p)) {
-        p.regs[0] = me.pid;
-        p.pending_status = me.exit_code;
-        p.has_pending_status = (p.wait_status_ptr != 0);
-        p.state = EsperState::ready;
-        me.state = EsperState::free; // reaped by the just-woken wait()
+        // Honor wait4's pid argument: a parent blocked in waitpid(PID) must only
+        // be woken+reaped by THAT child. A non-matching child just stays a zombie
+        // (a later wait collects it); waking the parent with the wrong pid makes
+        // dpkg-deb's `r != pid` check abort the unpack. target<=0 = any child.
+        if (p.wait4_target_pid <= 0 ||
+            me.pid == static_cast<uint32_t>(p.wait4_target_pid)) {
+            p.regs[0] = me.pid;
+            p.pending_status = me.exit_code;
+            p.has_pending_status = (p.wait_status_ptr != 0);
+            p.state = EsperState::ready;
+            me.state = EsperState::free; // reaped by the just-woken wait()
+        }
         return;
     }
     // Parent isn't blocked in wait4. Deliver SIGCHLD so a parent that installed
@@ -360,12 +438,23 @@ int esper_preempt_and_pick(int cur_idx) {
     const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
     if (arch::this_cpu_id() == 0) wake_sleepers_locked(); // central nanosleep wake
     int next = -1;
-    for (uint32_t step = 1; step <= kMaxEspers; ++step) {
-        const int idx = static_cast<int>((cur_idx + step) % kMaxEspers);
-        if (idx == cur_idx) continue;
-        if (g_espers[idx].state == EsperState::ready) {
-            next = idx;
-            break;
+    // Honor the EL0 core cap here too: pick_and_claim_locked's header promises
+    // "preempt/park/exit all route through [the cap]", but preempt has its own
+    // loop -- so without this guard the 100Hz network_tick preempt let a capped
+    // core grab a ready Esper and run it at EL0, silently defeating the cap (apt's
+    // single-core wrapper still ran multi-core -> still hit the deep-SMP hang).
+    // A capped core skips the scan (next stays -1 -> keep cur, i.e. stay idle if
+    // it was idle; any Esper it is mid-running drains out via the capped park/exit
+    // pick). cpu 0 always passes (cap is >= 1); uncapped g_online_cpus == ncores
+    // so every core scans as before -- normal SMP is unchanged.
+    if (arch::this_cpu_id() < g_online_cpus) {
+        for (uint32_t step = 1; step <= kMaxEspers; ++step) {
+            const int idx = static_cast<int>((cur_idx + step) % kMaxEspers);
+            if (idx == cur_idx) continue;
+            if (g_espers[idx].state == EsperState::ready && !running_somewhere_locked(idx)) {
+                next = idx;
+                break;
+            }
         }
     }
     if (next < 0) {
@@ -535,12 +624,36 @@ void esper_set_running(int index) {
     anti_skill_unlock_irqrestore(g_esper_lock, flags);
 }
 
+// Park cur and pick a successor, but if there is NO successor, atomically un-park
+// cur and keep it running on THIS cpu -- all under one g_esper_lock acquisition.
+// The caller (blocking wait4) used to do esper_park_and_pick() then, on next<0,
+// esper_set_running() in a SECOND lock acquisition; in the released-lock gap a
+// child-exit wake could ready cur and another core could claim it, then this core
+// would also eret back into cur -> the same Esper running on two cores (the apt
+// smp=8 double-schedule, confirmed via [RUNSLOTS]). Doing the un-park inside the
+// same critical section closes that window.
+int esper_park_and_pick_keep(int cur_idx) {
+    const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
+    if (cur_idx >= 0 && static_cast<uint32_t>(cur_idx) < kMaxEspers) {
+        g_espers[cur_idx].state = EsperState::waiting;
+        clear_running_slot_locked(cur_idx);
+    }
+    const int next = pick_and_claim_locked(cur_idx);
+    if (next < 0 && cur_idx >= 0 && static_cast<uint32_t>(cur_idx) < kMaxEspers) {
+        g_espers[cur_idx].state = EsperState::running; // un-park: keep cur running
+        const uint32_t cpu = arch::this_cpu_id();
+        if (cpu < kMaxCpus) g_running[cpu] = cur_idx;
+    }
+    anti_skill_unlock_irqrestore(g_esper_lock, flags);
+    return next;
+}
+
 int esper_pick_ready(int after) {
     const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
     wake_sleepers_locked();
     for (uint32_t step = 1; step <= kMaxEspers; ++step) {
         const int idx = static_cast<int>((after + step) % kMaxEspers);
-        if (g_espers[idx].state == EsperState::ready) {
+        if (g_espers[idx].state == EsperState::ready && !running_somewhere_locked(idx)) {
             anti_skill_unlock_irqrestore(g_esper_lock, flags);
             return idx;
         }

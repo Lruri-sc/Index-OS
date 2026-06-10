@@ -27,6 +27,11 @@ const MisakaMail &misaka_mail_status();
 // the VM joins your LAN and you want a reachable address). Gateway = x.y.z.1.
 void misaka_mail_set_ip(uint8_t a, uint8_t b, uint8_t c, uint8_t d);
 
+// Re-ring the virtio-net RX doorbell (vm-exit) so qemu's main loop runs SLIRP and
+// delivers pending RX. network_tick calls this each tick while a TCP connection
+// is live, to keep large downloads (apt) from stalling on HVF BQL starvation.
+void misaka_mail_kick_rx();
+
 // Send one ICMP echo request to `ip` and wait for the reply (resolving the
 // target's MAC via ARP first). Prints the outcome. `ip` nullptr -> the gateway.
 void misaka_mail_ping(const uint8_t ip[4]);

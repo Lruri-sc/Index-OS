@@ -565,12 +565,21 @@ const char *handle_inbound(const uint8_t *f, uint32_t len) {
                 if (data_off >= 20 && data_off <= len - 14 - ihl) {
                     const uint8_t *payload = tcp + data_off;
                     const uint32_t ip_total = rbe16(ip + 2);
-                    const uint32_t payload_len = ip_total - ihl - data_off;
-                    if (antenna_deliver_tcp(src_ip, src_port, dst_port, flags,
-                                            seq, ack, payload, payload_len)) {
-                        return "TCP -> delivered";
+                    // ip_total is the attacker-controlled IP total-length field.
+                    // Bound it against the frame we actually received BEFORE
+                    // deriving payload_len: a forged total > frame drives an OOB
+                    // read of the RX buffer in antenna_deliver_tcp (info leak),
+                    // and one < ihl+data_off underflows the unsigned subtraction
+                    // to ~4 GiB (massive OOB copy -> crash). Mirrors the ICMP and
+                    // UDP length checks above; this branch was missing it.
+                    if (ip_total >= ihl + data_off && ip_total <= len - 14) {
+                        const uint32_t payload_len = ip_total - ihl - data_off;
+                        if (antenna_deliver_tcp(src_ip, src_port, dst_port, flags,
+                                                seq, ack, payload, payload_len)) {
+                            return "TCP -> delivered";
+                        }
+                        return "TCP -> no socket";
                     }
-                    return "TCP -> no socket";
                 }
             }
         }
@@ -736,6 +745,20 @@ MisakaMail misaka_mail_probe() {
 
 const MisakaMail &misaka_mail_status() {
     return g_mail;
+}
+
+// Re-ring the RX doorbell to force a vm-exit so qemu's main loop gets the BQL,
+// runs SLIRP, and delivers pending RX into our ring. On HVF a guest that busy-
+// spins (apt's http-method recv + the doorbell-poll ext2 write of the downloaded
+// index) can keep qemu's main thread starved of the BQL so it never refills the
+// RX ring -- the download stalls. network_tick calls this each tick while a TCP
+// connection is live. CLEAN replacement for the [WD] console-dump that was
+// inadvertently providing these vm-exit kicks (apt downloads stalled the moment
+// that debug dump was disabled).
+void misaka_mail_kick_rx() {
+    if (g_rx_notify != 0) {
+        write16(g_rx_notify, uint16_t(kRxVq));
+    }
 }
 
 void misaka_mail_set_ip(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {

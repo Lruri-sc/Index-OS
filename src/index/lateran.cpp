@@ -526,6 +526,25 @@ int64_t lateran_pread(const char *name, uint64_t offset, char *buf, uint32_t len
     return -1;
 }
 
+int64_t lateran_pwrite(const char *name, uint64_t off, const char *buf, uint32_t len) {
+    FsGuard _g;
+    // Incremental (offset-based) write so the caller never falls back to the
+    // whole-file read-modify-write, which is capped at kElfReadCap (4 MiB) and
+    // would clamp larger writes. tmpfs routes to its own offset pwrite (Testament
+    // grows the node on demand) -- needed because apt's pkgcache.bin /
+    // srcpkgcache.bin (~5-6 MiB for a real suite) live on the tmpfs idxapt mounts
+    // over /var/cache/apt; without this apt died "write, still have N to write but
+    // couldn't" / "IO Error saving source cache". 9p and FAT have no incremental
+    // path -> -2 (whole-file fallback; those writes are small / in-memory).
+    if (tmpfs_owns_path(name)) {
+        return tmpfs_append_file(name, buf, len, off);
+    }
+    if (g_backend == Backend::ext2 && strip_host_prefix(name) == nullptr) {
+        return ext2_pwrite(name, off, buf, len);
+    }
+    return -2;
+}
+
 int64_t lateran_write_file(const char *name, const char *buf, uint32_t len) {
     FsGuard _g;
     if (tmpfs_owns_path(name)) return tmpfs_write_file(name, buf, len);
@@ -670,6 +689,19 @@ bool lateran_mkdir(const char *path) {
     wr32(&ent[28], 0); // directories report size 0
     if (!write_sector(dsec)) return false;
     return true;
+}
+
+// lstat: ext2 reports the symlink's own inode; other backends (tmpfs/9p/proc)
+// fall back to follow-stat (their symlink use is incidental).
+bool lateran_stat_nofollow(const char *path, LateranEntry *out) {
+    {
+        FsGuard _g;
+        if (!tmpfs_owns_path(path) && strip_host_prefix(path) == nullptr &&
+            !procfs_owns_path(path) && g_backend == Backend::ext2) {
+            return ext2_stat_nofollow(path, out);
+        }
+    }
+    return lateran_stat(path, out);
 }
 
 bool lateran_stat(const char *path, LateranEntry *out) {

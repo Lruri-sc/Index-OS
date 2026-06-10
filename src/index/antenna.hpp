@@ -15,7 +15,12 @@ namespace index {
 constexpr uint32_t kMaxAntennas = 16;
 // Per-socket RX ring. UDP encodes each datagram as [src_ip(4)][src_port(2)]
 // [len(2)][payload]; TCP just appends payload bytes (byte stream).
-constexpr uint32_t kAntennaRxBytes = 8192;
+constexpr uint32_t kAntennaRxBytes = 65536; // 64 KB rx ring (8x the wire window).
+// rx_buf lives OUT of the Antenna struct (g_rx_bufs[]/rxbuf() in antenna.cpp) so
+// the size doesn't bloat sizeof(Antenna) / the `Antenna{}` reset temporaries. NOTE:
+// a 256 KB ring (window pinned at the 65535 cap) did NOT change apt's 261 KB stall
+// -- the peer truncates apt's connection regardless of our window (busybox wget
+// completes the same 270 KB download over this stack); see apt-chroot.md part8.
 // TCP retransmit buffer: holds at most one MSS-sized chunk of unacked data so
 // we can resend on a timer. Larger sends are flushed in pieces by the caller.
 constexpr uint32_t kAntennaTxBytes = 2048;
@@ -65,12 +70,19 @@ struct Antenna {
     uint16_t remote_port = 0;
     bool has_remote = false;
 
-    // RX ring. For UDP: datagram-aligned (8-byte header + payload per record).
-    // For TCP: a raw byte stream (no headers; recv reads in-order bytes).
-    uint8_t rx_buf[kAntennaRxBytes] = {};
+    // RX ring storage lives OUTSIDE this struct -- see g_rx_bufs[] / rxbuf() in
+    // antenna.cpp. Keeping the (up to 64 KB) buffer out keeps sizeof(Antenna)
+    // tiny so `g_ants[i] = Antenna{}` / `child = Antenna{}` resets don't put a
+    // buffer-sized temporary on the stack (that overflowed the secondary stack).
+    // For UDP the ring is datagram-aligned (8-byte header + payload per record);
+    // for TCP it's a raw in-order byte stream. Only the indices below are reset.
     uint32_t rx_head = 0; // next byte to read out
     uint32_t rx_tail = 0; // next byte to write in
     uint32_t rx_avail = 0; // bytes currently used
+    uint32_t last_adv_win = 0; // receive window last advertised to the peer; lets
+    // recv send a window-update only when the window has reopened by >= 1 MSS
+    // (RFC 1122 / SWS avoidance) -- needed so bursty O_NONBLOCK readers (apt)
+    // keep the peer's window advancing the way a blocking reader (wget) does.
 
     // --- TCP-only state (unused for UDP) ---
     TcpState tcp_state = TcpState::Closed;
@@ -129,7 +141,8 @@ int64_t antenna_sendto(int idx, const uint8_t *dst_ip, uint16_t dst_port,
 // sender address to src_ip/*src_port if non-null. Returns bytes received,
 // 0 if would-block on a non-blocking socket, or -errno.
 int64_t antenna_recvfrom(int idx, uint8_t *buf, uint32_t cap, uint8_t *src_ip,
-                         uint16_t *src_port, uint32_t timeout_ticks);
+                         uint16_t *src_port, uint32_t timeout_ticks,
+                         bool nonblock = false);
 
 // Local address for getsockname(). Always returns our NIC IP + the bound port.
 bool antenna_get_local(int idx, uint8_t local_ip[4], uint16_t *local_port);
@@ -138,6 +151,7 @@ bool antenna_get_remote(int idx, uint8_t remote_ip[4], uint16_t *remote_port);
 
 // poll/epoll readiness mask (POLLIN/OUT/HUP bits), non-consuming.
 uint32_t antenna_poll(int idx);
+bool antenna_is_udp(int idx); // recvmsg() picks the UDP datagram recv path for these
 
 // Tear down an Antenna reference (close()). Drops the refcount and frees the
 // slot when it hits zero. fork/dup3 share the same Antenna and inc the count

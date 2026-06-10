@@ -336,6 +336,29 @@ PersonalReality *reality_alloc() {
     return nullptr; // pool exhausted
 }
 
+// Per-CPU "address space whose TTBR0 is loaded RIGHT NOW" -- the hardware view,
+// updated only by the core itself (load_ctx sets it, leave_user / reality_unref
+// clear it). Distinct from esper.cpp's g_running[] (the scheduler's bookkeeping,
+// which esper_group_exit_and_pick clears from the faulting core BEFORE the target
+// core has actually stopped). reality_unref's destroy path spins on this so it
+// never frees page tables a sibling thread is still executing on (the apt smp=8
+// "mm wiped while running" UAF).
+constexpr uint32_t kPr2MaxCpus = 8;
+PersonalReality *g_cpu_active_mm[kPr2MaxCpus] = {};
+
+void pr2_note_active_mm(PersonalReality *mm) {
+    const uint32_t c = static_cast<uint32_t>(arch::this_cpu_id());
+    if (c < kPr2MaxCpus) {
+        __atomic_store_n(&g_cpu_active_mm[c], mm, __ATOMIC_RELEASE);
+    }
+}
+
+// C-linkage hook for leave_user (asm): this CPU just reinstalled the kernel TTBR0
+// and is returning to the idle/scheduler loop, so it is no longer executing in any
+// user address space. Clearing here (one place) keeps the reality_unref barrier
+// from needlessly spinning on a stale active-mm slot left by a now-idle core.
+extern "C" void pr2_leave_mm() { pr2_note_active_mm(nullptr); esper_clear_active_esper(); }
+
 void reality_ref(PersonalReality *mm) {
     if (mm == nullptr) return;
     const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
@@ -354,13 +377,49 @@ void reality_unref(Esper *e) {
         anti_skill_unlock_irqrestore(g_esper_lock, flags);
     }
     if (!destroy) return;
-    // Last sharer: this CPU's TTBR0 may still point at mm->ttbr0. Switch to the
-    // kernel table BEFORE freeing the page tables (mirror Linux switching to
-    // init_mm before mmdrop) so a kernel fetch through TTBR0 can't hit a page
-    // we just returned to the allocator -- the SMP use-after-free guard that
-    // as_unref used to provide.
-    asm volatile("msr ttbr0_el1, %0" ::"r"(teleport_kernel_ttbr0()) : "memory");
-    asm volatile("dsb ish; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+    // ★ROOT of the smp=8 apt TTBR0=0 FAULTLOOP★ Only get THIS CPU off the dying
+    // mm if it is actually RUNNING on it. The old code switched TTBR0 to the
+    // kernel table UNCONDITIONALLY -- but reality_unref is usually called by a
+    // DIFFERENT process reaping an exited child (wait4 -> reality_unref(child)),
+    // and that caller's CPU is running on ITS OWN live mm. Clobbering TTBR0 to the
+    // kernel(0) table there left the reaping process (apt-get) executing with
+    // TTBR0=0: every user fetch then translation-faults (FAR==ELR, valid VMA but
+    // "unmapped") until the loop guard kills it. We only need the
+    // switch-to-kernel when this CPU itself was on the mm being freed (a process
+    // freeing its own address space). Mirror Linux: switch to init_mm before
+    // mmdrop, but ONLY for the task whose mm it is.
+    uint64_t live_ttbr0 = 0;
+    asm volatile("mrs %0, ttbr0_el1" : "=r"(live_ttbr0));
+    const bool on_dying_mm =
+        (live_ttbr0 & 0x0000FFFFFFFFF000ULL) == (mm->ttbr0 & 0x0000FFFFFFFFF000ULL);
+    if (on_dying_mm) {
+        // Switch to the kernel table BEFORE freeing the page tables so a kernel
+        // fetch through TTBR0 can't hit a page we just returned to the allocator.
+        asm volatile("msr ttbr0_el1, %0" ::"r"(teleport_kernel_ttbr0()) : "memory");
+        asm volatile("dsb ish; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+        pr2_note_active_mm(nullptr); // this core is off the (now dying) mm
+    }
+    // SMP barrier (the apt smp=8 "mm wiped while running" root cause): a CLONE_VM
+    // sibling thread can still be EXECUTING in this address space on another core
+    // when refs hits 0 -- esper_group_exit_and_pick marks such siblings exited and
+    // clears their scheduler run-slot from the FAULTING core, but the hardware keeps
+    // running them (TTBR0 still pointed here) until that core takes an IRQ and
+    // reschedules. Freeing the page tables now would pull them out from under a
+    // running core -> wild jump. esper_group_exit_and_pick already IPI'd the
+    // siblings (esper_kick_secondaries); wait until every other core has actually
+    // rescheduled off this mm before reclaiming. g_running[] can't be used (cleared
+    // early); g_cpu_active_mm[] is the hardware truth (each core clears its own).
+    {
+        const uint32_t self = static_cast<uint32_t>(arch::this_cpu_id());
+        for (uint32_t c = 0; c < kPr2MaxCpus; ++c) {
+            if (c == self) continue;
+            uint64_t spins = 0;
+            while (__atomic_load_n(&g_cpu_active_mm[c], __ATOMIC_ACQUIRE) == mm) {
+                if (++spins > 400000000ULL) break; // safety valve: never hard-hang
+                asm volatile("yield" ::: "memory");
+            }
+        }
+    }
     pr2_destroy(mm); // frees page tables + leaf pages; sets mm->ttbr0 = 0
     const uint64_t flags = anti_skill_lock_irqsave(g_esper_lock);
     mm->in_use = false;
@@ -564,7 +623,14 @@ bool pr2_fork(Esper *parent, Esper *child) {
                     if (ce == nullptr) { ok = false; break; }
                     *ce = ppa | kPage | attrs_ro;
                     page_ref(ppa); // now mapped in two address spaces
-                    asm volatile("tlbi vaae1is, %0" ::"r"(va >> 12)); // flush parent's stale RW TLB
+                    // dsb BEFORE the tlbi (was missing): order the RO PTE write
+                    // above ahead of the broadcast invalidate. Without it a tlbi is
+                    // unordered w.r.t. the store, so another core re-walking this VA
+                    // could reload the stale WRITABLE entry after the invalidate but
+                    // before the RO write propagates -> write the shared CoW page
+                    // without copying. [ARM ARM: tlbi requires a preceding dsb.]
+                    asm volatile("dsb ish" ::: "memory");
+                    asm volatile("tlbi vaae1is, %0" ::"r"(va >> 12)); // flush stale RW
                 }
             }
             asm volatile("dsb ish; isb" ::: "memory");
@@ -659,9 +725,37 @@ void pr2_remove_vma_range(Esper *e, uint64_t lo, uint64_t hi) {
             }
             v.start = hi;
         } else {
-            // Middle hole -- losing the tail past `lo` is the only thing we
-            // can do without a free slot to split into.
-            v.end = lo;
+            // Middle hole: SPLIT into head [start, lo) and tail [hi, orig.end).
+            // The old code DROPPED the tail ("losing the tail past lo") -- a real
+            // bug. glibc's _dl_map_segments maps a shared lib's WHOLE span as one
+            // file-backed reservation, then MAP_FIXEDs .data over the middle; the
+            // MAP_FIXED carve calls us, and dropping the tail lost the lib's .bss
+            // (memsz>filesz, the reservation tail) -> .bss had NO VMA -> dpkg/echo
+            // faulted READING their unmapped .bss (FAR in a no-VMA hole). Re-add
+            // the tail with file_off/seg_pad rebased (mirrors pr2_mprotect's
+            // split) so demand faults read the right bytes. Pr2Guard is re-entrant
+            // so calling pr2_add_vma here is safe; the new tail has start>=hi so it
+            // is skipped by the remaining iterations of this loop.
+            const Vma orig = v;
+            v.end = lo; // head retains start / file_off / seg_pad
+            const uint64_t seg_va = orig.start + orig.seg_pad; // file-data origin
+            const uint64_t seg_end = seg_va + orig.file_size;  // file-data end
+            if (orig.kind == VmaKind::File &&
+                (orig.file_src != nullptr || orig.file_path[0] != '\0')) {
+                const uint64_t fe = (seg_end < orig.end) ? seg_end : orig.end;
+                uint64_t nsv, noff, nsz;
+                if (hi <= seg_va) { nsv = seg_va; noff = orig.file_off;
+                                    nsz = (fe > nsv) ? (fe - nsv) : 0; }
+                else { nsv = hi; noff = orig.file_off + (hi - seg_va);
+                       nsz = (fe > hi) ? (fe - hi) : 0; }
+                pr2_add_vma(e, hi, orig.end, orig.prot,
+                            static_cast<uint8_t>(VmaKind::File), orig.file_src,
+                            noff, nsz, nsv,
+                            orig.file_src != nullptr ? nullptr : orig.file_path);
+            } else {
+                pr2_add_vma(e, hi, orig.end, orig.prot,
+                            static_cast<uint8_t>(orig.kind), nullptr, 0, 0, 0);
+            }
         }
     }
     // Tear down already-mapped pages so the new mapping's permissions actually

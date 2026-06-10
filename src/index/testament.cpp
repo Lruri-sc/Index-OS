@@ -10,7 +10,7 @@ namespace {
 
 constexpr uint32_t kMaxNodes  = 1024;   // total tmpfs inodes across all mounts
 constexpr uint32_t kMaxMounts = 8;
-constexpr uint32_t kNameCap   = 64;     // matches LateranEntry::name
+constexpr uint32_t kNameCap   = 256;    // matches LateranEntry::name (NAME_MAX+1)
 constexpr uint32_t kPointCap  = 128;
 
 constexpr uint32_t kModeDir  = 0x4000u; // S_IFDIR
@@ -306,7 +306,10 @@ int64_t tmpfs_write_file(const char *path, const char *buf, uint32_t len) {
     }
     if (g_nodes[n].is_dir) return -1;
     // Overwrite from offset 0.
-    if (!ensure_cap(g_nodes[n], len ? len : 1)) return -1;
+    // -ENOSPC (heap exhausted) not the default -1 (= -EPERM "Operation not
+    // permitted"), which baffled apt -- a tmpfs write that can't grow is "no
+    // space", not "not permitted".
+    if (!ensure_cap(g_nodes[n], len ? len : 1)) return -28;
     for (uint32_t i = 0; i < len; ++i) g_nodes[n].data[i] = static_cast<uint8_t>(buf[i]);
     g_nodes[n].size = len;
     g_nodes[n].mtime = now_secs();
@@ -318,7 +321,14 @@ int64_t tmpfs_append_file(const char *path, const char *buf, uint32_t len, uint6
     if (n < 0 || g_nodes[n].is_dir) return -1;
     const uint64_t end = off + len;
     if (end > 0xFFFFFFFFu) return -1;
-    if (!ensure_cap(g_nodes[n], static_cast<uint32_t>(end ? end : 1))) return -1;
+    if (!ensure_cap(g_nodes[n], static_cast<uint32_t>(end ? end : 1))) return -28; // -ENOSPC
+    // Sparse write past EOF: zero the gap [size, off) so a write beyond the
+    // current end never exposes stale bytes a prior truncate-down left in the
+    // buffer (ensure_cap only zeroes the region it newly grows, and cap may
+    // already be big enough here). The old whole-file RMW path zero-filled this
+    // gap; preserve that now that lateran_pwrite routes tmpfs here directly.
+    for (uint32_t i = g_nodes[n].size; i < static_cast<uint32_t>(off); ++i)
+        g_nodes[n].data[i] = 0;
     for (uint32_t i = 0; i < len; ++i)
         g_nodes[n].data[static_cast<uint32_t>(off) + i] = static_cast<uint8_t>(buf[i]);
     if (static_cast<uint32_t>(end) > g_nodes[n].size) g_nodes[n].size = static_cast<uint32_t>(end);

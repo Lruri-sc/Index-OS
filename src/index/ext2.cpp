@@ -39,6 +39,13 @@ Super g_sb;
 alignas(16) uint8_t g_blk[kMaxBlock];   // general block scratch (data / dir)
 alignas(16) uint8_t g_ind[kMaxBlock];   // single-indirect block scratch
 alignas(16) uint8_t g_ind2[kMaxBlock];  // double-indirect mid scratch
+alignas(16) uint8_t g_ind3[kMaxBlock];  // triple-indirect leaf scratch (write path)
+// Dedicated block/inode-BITMAP scratch for the allocators (alloc_block /
+// free_block / alloc_inode / free_inode). MUST be distinct from g_ind/g_ind2/
+// g_ind3: inode_set_block holds an index table in those buffers and then calls
+// alloc_block for a child index block -- if the allocator reused g_ind it would
+// clobber the table mid-build and corrupt the file (double/triple-indirect).
+alignas(16) uint8_t g_bmp[kMaxBlock];
 alignas(16) uint8_t g_inode[256];       // one inode
 
 // [BLKCACHE] Direct-mapped buffer cache. ext2 had no block cache, so every
@@ -275,6 +282,34 @@ uint32_t dir_lookup(const char *name) {
     return 0;
 }
 
+// rmdir precondition: a directory is removable only when it contains nothing
+// but "." and "..". Operates on the CURRENT g_inode (caller read_inode()s the
+// target dir first). Bounds-checked exactly like dir_lookup.
+bool dir_is_empty() {
+    const uint32_t size = inode_size();
+    const uint32_t bs = g_sb.block_size;
+    for (uint32_t lbn = 0; lbn * bs < size; ++lbn) {
+        const uint32_t pb = map_block(lbn);
+        if (pb == 0 || !read_block(pb, g_blk)) continue;
+        uint32_t off = 0;
+        while (off + 8 <= bs) {
+            const uint32_t e_ino = rd32(&g_blk[off]);
+            const uint16_t rec = rd16(&g_blk[off + 4]);
+            const uint8_t nlen = g_blk[off + 6];
+            if (rec == 0) break;
+            if (static_cast<uint32_t>(off) + 8u + nlen > bs || rec < 8u + nlen) break;
+            if (e_ino != 0) {
+                const bool dot = (nlen == 1 && g_blk[off + 8] == '.');
+                const bool dotdot =
+                    (nlen == 2 && g_blk[off + 8] == '.' && g_blk[off + 9] == '.');
+                if (!dot && !dotdot) return false;
+            }
+            off += rec;
+        }
+    }
+    return true;
+}
+
 // [DENTRY CACHE] Resolved abs-path -> inode. ls -laR / find stat thousands of
 // files; without this EVERY stat re-walks the full path from root
 // (resolve_from(2,...)), re-running dir_lookup for /usr, /usr/lib, ... each time
@@ -325,7 +360,7 @@ uint32_t resolve_from(uint32_t start_ino, const char *path, uint32_t depth,
     }
     if (!read_inode(parent)) return 0;
     while (*p) {
-        char comp[64];
+        char comp[256];
         uint32_t n = 0;
         while (*p && *p != '/' && n + 1 < sizeof(comp)) comp[n++] = *p++;
         comp[n] = 0;
@@ -375,7 +410,7 @@ uint32_t resolve(const char *path) {
     int32_t slash = -1;
     for (uint32_t i = 0; path[i]; ++i) if (path[i] == '/') slash = static_cast<int32_t>(i);
     if (slash > 0) {
-        char parentp[192], leaf[64];
+        char parentp[256], leaf[256]; // NAME_MAX+1 leaf (was 64); long apt paths
         if (static_cast<uint32_t>(slash) < sizeof(parentp)) {
             for (int32_t i = 0; i < slash; ++i) parentp[i] = path[i];
             parentp[slash] = 0;
@@ -591,6 +626,30 @@ bool ext2_fs_stats(Ext2FsStats *out) {
     return true;
 }
 
+// lstat: identical to ext2_stat but does NOT follow a final symlink, so the
+// caller sees the link's own inode (S_IFLNK mode, size = target length, its
+// own ino/ctime). glibc ldconfig keys its aux-cache on (ino,ctime,size,dev)
+// from lstat -- reporting the TARGET's identity for a symlink (or zeros)
+// collides ids across files and trips insert_to_aux_cache's abort().
+bool ext2_stat_nofollow(const char *path, LateranEntry *out) {
+    if (!g_sb.mounted || path == nullptr || out == nullptr) return false;
+    const uint32_t ino = resolve_from(2, path, 0, /*nofollow_last=*/true);
+    if (ino == 0) return false;
+    out->is_dir = inode_is_dir();
+    out->size = inode_size();
+    out->uid = 0;
+    out->gid = 0;
+    out->mode = inode_mode();
+    out->atime = rd32(&g_inode[8]);
+    out->ctime = rd32(&g_inode[12]);
+    out->mtime = rd32(&g_inode[16]);
+    out->nlink = rd16(&g_inode[26]);
+    out->first_cluster = 0;
+    out->name[0] = 0;
+    out->ino = ino;
+    return true;
+}
+
 bool ext2_stat(const char *path, LateranEntry *out) {
     if (!g_sb.mounted || path == nullptr || out == nullptr) return false;
     const uint32_t ino = resolve(path);
@@ -659,25 +718,35 @@ bool write_inode(uint32_t ino) {
 }
 
 // Allocate a free block (data) from the bitmaps. Returns its block number or 0.
+// Round-robin hint: the group we last allocated from. Starting every scan at
+// group 0 made large writes pathologically slow -- a big pre-populated rootfs
+// (629 MB) fills the early groups, so each allocation re-read O(groups) group
+// descriptors before reaching free space. With 1024+ allocations for a ~1MB file
+// (apt's package cache) that is O(blocks * groups) and appeared to hang. Resuming
+// the scan from the last successful group makes sequential allocation ~O(1)/block.
+uint32_t g_alloc_hint = 0;
 uint32_t alloc_block() {
-    for (uint32_t g = 0; g < g_sb.group_count; ++g) {
+    for (uint32_t s = 0; s < g_sb.group_count; ++s) {
+        const uint32_t g = (g_alloc_hint + s) % g_sb.group_count;
         uint8_t gd[32];
         if (!read_gd(g, gd)) return 0;
         if (rd16(&gd[12]) == 0) continue; // no free blocks in this group
         const uint32_t bbmp = rd32(&gd[0]);
-        if (!read_block(bbmp, g_ind)) return 0;
+        if (!read_block(bbmp, g_bmp)) return 0;
         for (uint32_t i = 0; i < g_sb.blocks_per_group; ++i) {
             const uint32_t bno = g_sb.first_data_block + g * g_sb.blocks_per_group + i;
             if (bno >= g_sb.block_count) break;
-            if (!(g_ind[i / 8] & (1u << (i % 8)))) {
-                g_ind[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
-                if (!write_block(bbmp, g_ind)) return 0;
+            if (!(g_bmp[i / 8] & (1u << (i % 8)))) {
+                g_bmp[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+                if (!write_block(bbmp, g_bmp)) return 0;
                 wr16(&gd[12], static_cast<uint16_t>(rd16(&gd[12]) - 1));
                 write_gd(g, gd);
                 sb_adjust(-1, 0);
-                // Zero the freshly allocated block.
-                for (uint32_t b = 0; b < g_sb.block_size; ++b) g_blk[b] = 0;
-                write_block(bno, g_blk);
+                // Zero the freshly allocated block (reuse g_bmp -- bitmap already
+                // persisted above -- so we never touch g_blk/g_ind here).
+                for (uint32_t b = 0; b < g_sb.block_size; ++b) g_bmp[b] = 0;
+                write_block(bno, g_bmp);
+                g_alloc_hint = g; // resume here next time
                 return bno;
             }
         }
@@ -693,10 +762,10 @@ void free_block(uint32_t bno) {
     uint8_t gd[32];
     if (!read_gd(g, gd)) return;
     const uint32_t bbmp = rd32(&gd[0]);
-    if (!read_block(bbmp, g_ind)) return;
-    if (g_ind[i / 8] & (1u << (i % 8))) {
-        g_ind[i / 8] &= static_cast<uint8_t>(~(1u << (i % 8)));
-        write_block(bbmp, g_ind);
+    if (!read_block(bbmp, g_bmp)) return;
+    if (g_bmp[i / 8] & (1u << (i % 8))) {
+        g_bmp[i / 8] &= static_cast<uint8_t>(~(1u << (i % 8)));
+        write_block(bbmp, g_bmp);
         wr16(&gd[12], static_cast<uint16_t>(rd16(&gd[12]) + 1));
         write_gd(g, gd);
         sb_adjust(1, 0);
@@ -711,11 +780,11 @@ uint32_t alloc_inode(bool is_dir) {
         if (!read_gd(g, gd)) return 0;
         if (rd16(&gd[14]) == 0) continue; // no free inodes
         const uint32_t ibmp = rd32(&gd[4]);
-        if (!read_block(ibmp, g_ind)) return 0;
+        if (!read_block(ibmp, g_bmp)) return 0;
         for (uint32_t i = 0; i < g_sb.inodes_per_group; ++i) {
-            if (!(g_ind[i / 8] & (1u << (i % 8)))) {
-                g_ind[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
-                if (!write_block(ibmp, g_ind)) return 0;
+            if (!(g_bmp[i / 8] & (1u << (i % 8)))) {
+                g_bmp[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+                if (!write_block(ibmp, g_bmp)) return 0;
                 wr16(&gd[14], static_cast<uint16_t>(rd16(&gd[14]) - 1));
                 if (is_dir) wr16(&gd[16], static_cast<uint16_t>(rd16(&gd[16]) + 1));
                 write_gd(g, gd);
@@ -733,10 +802,10 @@ void free_inode(uint32_t ino, bool was_dir) {
     uint8_t gd[32];
     if (!read_gd(g, gd)) return;
     const uint32_t ibmp = rd32(&gd[4]);
-    if (!read_block(ibmp, g_ind)) return;
-    if (g_ind[i / 8] & (1u << (i % 8))) {
-        g_ind[i / 8] &= static_cast<uint8_t>(~(1u << (i % 8)));
-        write_block(ibmp, g_ind);
+    if (!read_block(ibmp, g_bmp)) return;
+    if (g_bmp[i / 8] & (1u << (i % 8))) {
+        g_bmp[i / 8] &= static_cast<uint8_t>(~(1u << (i % 8)));
+        write_block(ibmp, g_bmp);
         wr16(&gd[14], static_cast<uint16_t>(rd16(&gd[14]) + 1));
         if (was_dir && rd16(&gd[16]) > 0) wr16(&gd[16], static_cast<uint16_t>(rd16(&gd[16]) - 1));
         write_gd(g, gd);
@@ -752,7 +821,7 @@ bool resolve_parent(const char *path, uint32_t *parent_ino, char *leaf, uint32_t
     while (*p == '/') ++p;
     if (*p == 0) return false; // no leaf (it's the root)
     for (;;) {
-        char comp[64];
+        char comp[256];
         uint32_t n = 0;
         while (*p && *p != '/' && n + 1 < sizeof(comp)) comp[n++] = *p++;
         comp[n] = 0;
@@ -766,8 +835,25 @@ bool resolve_parent(const char *path, uint32_t *parent_ino, char *leaf, uint32_t
             return leaf[0] != 0;
         }
         if (!inode_is_dir()) return false;
-        const uint32_t next = dir_lookup(comp);
+        uint32_t next = dir_lookup(comp);
         if (next == 0 || !read_inode(next)) return false;
+        // Follow an INTERMEDIATE symlink so creating a file through it works.
+        // Modern Ubuntu usr-merges /bin /sbin /lib into symlinks -> usr/* , so
+        // dpkg creating '/bin/nano.dpkg-new' must chase /bin -> usr/bin to find
+        // the real parent dir. Without this, resolve_parent hit the symlink,
+        // saw "not a directory", and failed ENOENT -> nano/htop (anything under
+        // /bin) couldn't unpack. resolve_from follows symlinks; reuse it on the
+        // target, rebased on the directory that holds the link for relative ones.
+        uint32_t sl_depth = 0;
+        while (inode_is_symlink() && sl_depth++ < 8) {
+            char tgt[256];
+            const int32_t tl = inode_read_symlink(tgt, sizeof(tgt));
+            if (tl <= 0) return false;
+            const uint32_t r = (tgt[0] == '/') ? resolve_from(2, tgt, 0, false)
+                                               : resolve_from(ino, tgt, 0, false);
+            if (r == 0 || !read_inode(r)) return false;
+            next = r;
+        }
         ino = next;
     }
 }
@@ -839,6 +925,7 @@ void free_inode_blocks() {
         const uint32_t b = rd32(&g_inode[40 + i * 4]);
         if (b) free_block(b);
     }
+    // single-indirect (i_block[12])
     const uint32_t ind = rd32(&g_inode[40 + 12 * 4]);
     if (ind) {
         if (read_block(ind, g_ind2)) {
@@ -849,6 +936,126 @@ void free_inode_blocks() {
         }
         free_block(ind);
     }
+    // double-indirect (i_block[13]): g_ind2 = top table, g_ind = leaf table.
+    const uint32_t dind = rd32(&g_inode[40 + 13 * 4]);
+    if (dind) {
+        if (read_block(dind, g_ind2)) {
+            for (uint32_t i = 0; i < per; ++i) {
+                const uint32_t mid = rd32(&g_ind2[i * 4]);
+                if (mid == 0) continue;
+                if (read_block(mid, g_ind)) {
+                    for (uint32_t j = 0; j < per; ++j) {
+                        const uint32_t b = rd32(&g_ind[j * 4]);
+                        if (b) free_block(b);
+                    }
+                }
+                free_block(mid);
+            }
+        }
+        free_block(dind);
+    }
+    // triple-indirect (i_block[14]): g_ind2 = top, g_ind3 = mid, g_ind = leaf.
+    const uint32_t tind = rd32(&g_inode[40 + 14 * 4]);
+    if (tind) {
+        if (read_block(tind, g_ind2)) {
+            for (uint32_t i = 0; i < per; ++i) {
+                const uint32_t d2 = rd32(&g_ind2[i * 4]);
+                if (d2 == 0) continue;
+                if (read_block(d2, g_ind3)) {
+                    for (uint32_t j = 0; j < per; ++j) {
+                        const uint32_t mid = rd32(&g_ind3[j * 4]);
+                        if (mid == 0) continue;
+                        if (read_block(mid, g_ind)) {
+                            for (uint32_t k = 0; k < per; ++k) {
+                                const uint32_t b = rd32(&g_ind[k * 4]);
+                                if (b) free_block(b);
+                            }
+                        }
+                        free_block(mid);
+                    }
+                }
+                free_block(d2);
+            }
+        }
+        free_block(tind);
+    }
+}
+
+// Write-side of map_block: install physical block `db` as the current g_inode's
+// logical block `lbn`, allocating single/double/triple-indirect index blocks as
+// needed. Mirrors map_block's level layout exactly so reads and writes agree.
+// *idx counts newly-allocated INDEX blocks (for i_blocks accounting; the caller
+// counts data blocks). Index blocks are read-modify-written per call -- simple
+// and correct; whole-file writes here are not the hot path. Returns false on
+// disk-full / IO error. Buffers: g_ind/g_ind2/g_ind3 for the up-to-3 index
+// levels (g_blk, which holds the data block, is untouched).
+bool inode_set_block(uint32_t lbn, uint32_t db, uint32_t *idx) {
+    uint8_t *iblock = &g_inode[40];
+    const uint32_t per = g_sb.block_size / 4;
+    const uint32_t bs = g_sb.block_size;
+    if (lbn < 12) { wr32(&iblock[lbn * 4], db); return true; }
+    lbn -= 12;
+    if (lbn < per) { // single-indirect, i_block[12]
+        uint32_t ind = rd32(&iblock[12 * 4]);
+        if (ind == 0) {
+            ind = alloc_block(); if (ind == 0) return false; ++*idx;
+            for (uint32_t i = 0; i < bs; ++i) g_ind[i] = 0;
+            wr32(&iblock[12 * 4], ind);
+        } else if (!read_block(ind, g_ind)) return false;
+        wr32(&g_ind[lbn * 4], db);
+        return write_block(ind, g_ind);
+    }
+    lbn -= per;
+    if (lbn < per * per) { // double-indirect, i_block[13]: g_ind=top, g_ind2=leaf
+        uint32_t dind = rd32(&iblock[13 * 4]);
+        bool top_dirty = false;
+        if (dind == 0) {
+            dind = alloc_block(); if (dind == 0) return false; ++*idx; top_dirty = true;
+            for (uint32_t i = 0; i < bs; ++i) g_ind[i] = 0;
+            wr32(&iblock[13 * 4], dind);
+        } else if (!read_block(dind, g_ind)) return false;
+        const uint32_t ti = lbn / per, li = lbn % per;
+        uint32_t mid = rd32(&g_ind[ti * 4]);
+        if (mid == 0) {
+            mid = alloc_block(); if (mid == 0) return false; ++*idx;
+            for (uint32_t i = 0; i < bs; ++i) g_ind2[i] = 0;
+            wr32(&g_ind[ti * 4], mid); top_dirty = true;
+        } else if (!read_block(mid, g_ind2)) return false;
+        wr32(&g_ind2[li * 4], db);
+        if (!write_block(mid, g_ind2)) return false;
+        if (top_dirty && !write_block(dind, g_ind)) return false;
+        return true;
+    }
+    lbn -= per * per;
+    if (lbn < per * per * per) { // triple, i_block[14]: g_ind=top,g_ind2=mid,g_ind3=leaf
+        uint32_t tind = rd32(&iblock[14 * 4]);
+        bool top_dirty = false;
+        if (tind == 0) {
+            tind = alloc_block(); if (tind == 0) return false; ++*idx; top_dirty = true;
+            for (uint32_t i = 0; i < bs; ++i) g_ind[i] = 0;
+            wr32(&iblock[14 * 4], tind);
+        } else if (!read_block(tind, g_ind)) return false;
+        const uint32_t ai = lbn / (per * per), bi = (lbn / per) % per, ci = lbn % per;
+        uint32_t d2 = rd32(&g_ind[ai * 4]);
+        bool mid_dirty = false;
+        if (d2 == 0) {
+            d2 = alloc_block(); if (d2 == 0) return false; ++*idx;
+            for (uint32_t i = 0; i < bs; ++i) g_ind2[i] = 0;
+            wr32(&g_ind[ai * 4], d2); top_dirty = true;
+        } else if (!read_block(d2, g_ind2)) return false;
+        uint32_t mid = rd32(&g_ind2[bi * 4]);
+        if (mid == 0) {
+            mid = alloc_block(); if (mid == 0) return false; ++*idx;
+            for (uint32_t i = 0; i < bs; ++i) g_ind3[i] = 0;
+            wr32(&g_ind2[bi * 4], mid); mid_dirty = true;
+        } else if (!read_block(mid, g_ind3)) return false;
+        wr32(&g_ind3[ci * 4], db);
+        if (!write_block(mid, g_ind3)) return false;
+        if (mid_dirty && !write_block(d2, g_ind2)) return false;
+        if (top_dirty && !write_block(tind, g_ind)) return false;
+        return true;
+    }
+    return false; // beyond triple-indirect (>16 GiB at 1 KiB blocks)
 }
 
 } // namespace
@@ -857,7 +1064,7 @@ int64_t ext2_write_file(const char *path, const char *buf, uint32_t len) {
     if (!g_sb.mounted) return -1;
     dentry_invalidate_all(); // path->inode may change (create); keep cache coherent
     uint32_t parent_ino = 0;
-    char leaf[64];
+    char leaf[256];
     if (!resolve_parent(path, &parent_ino, leaf, sizeof(leaf))) return -1;
     if (!inode_is_dir()) return -1; // parent isn't a directory
 
@@ -881,8 +1088,6 @@ int64_t ext2_write_file(const char *path, const char *buf, uint32_t len) {
     wr16(&g_inode[26], 1);            // links_count
     stamp_inode_all(now_epoch_u32()); // atime/ctime/mtime
     const uint32_t bs = g_sb.block_size;
-    const uint32_t per = bs / 4;
-    uint32_t indirect = 0;
     uint32_t blocks_used = 0;
     uint32_t written = 0;
     for (uint32_t lbn = 0; written < len; ++lbn) {
@@ -893,21 +1098,11 @@ int64_t ext2_write_file(const char *path, const char *buf, uint32_t len) {
         if (n > bs) n = bs;
         for (uint32_t i = 0; i < bs; ++i) g_blk[i] = i < n ? static_cast<uint8_t>(buf[written + i]) : 0;
         if (!write_block(db, g_blk)) break;
-        if (lbn < 12) {
-            wr32(&g_inode[40 + lbn * 4], db);
-        } else if (lbn < 12 + per) {
-            if (indirect == 0) {
-                indirect = alloc_block();
-                if (indirect == 0) break;
-                ++blocks_used;
-                wr32(&g_inode[40 + 12 * 4], indirect);
-            }
-            if (!read_block(indirect, g_ind)) break;
-            wr32(&g_ind[(lbn - 12) * 4], db);
-            write_block(indirect, g_ind);
-        } else {
-            break; // beyond single-indirect (unsupported for writes)
-        }
+        // Install db at logical block lbn -- direct / single / double / triple
+        // indirect, allocating index blocks as needed (mirrors map_block). This
+        // is what lets guest-written files exceed the old 268 KiB single-indirect
+        // cap (busybox cp / apt packages were silently truncated before).
+        if (!inode_set_block(lbn, db, &blocks_used)) break;
         written += n;
     }
     wr32(&g_inode[4], written);                      // i_size
@@ -920,13 +1115,83 @@ int64_t ext2_write_file(const char *path, const char *buf, uint32_t len) {
     return static_cast<int64_t>(written);
 }
 
+// Incremental write at an arbitrary offset: write `len` bytes from `buf` at byte
+// offset `off` of file `path`, extending as needed. Unlike ext2_write_file (which
+// rewrites the WHOLE file -- O(n^2) for chunked writes and capped by the caller's
+// RAM buffer), this touches only the affected blocks: existing blocks are read-
+// modify-written, new blocks allocated on demand via inode_set_block (direct /
+// single / double / triple indirect). This is what makes large guest writes
+// practical (apt .deb downloads, dpkg-extracted binaries). Creates the file if
+// absent. Returns bytes written, or -1 on error. Buffers: g_inode = the file's
+// inode; g_blk = the data block; g_ind/g_ind2/g_ind3 = index tables (map_block /
+// inode_set_block); g_bmp = the allocator -- all distinct, so no self-clobber.
+int64_t ext2_pwrite(const char *path, uint64_t off, const char *buf, uint32_t len) {
+    if (!g_sb.mounted) return -1;
+    uint32_t parent_ino = 0;
+    char leaf[256];
+    if (!resolve_parent(path, &parent_ino, leaf, sizeof(leaf))) return -1;
+    if (!inode_is_dir()) return -1;
+    uint32_t ino = dir_lookup(leaf);
+    const bool is_new = (ino == 0);
+    if (is_new) {
+        dentry_invalidate_all();
+        ino = alloc_inode(false);
+        if (ino == 0) return -1;
+        for (uint32_t i = 0; i < g_sb.inode_size; ++i) g_inode[i] = 0;
+        wr16(&g_inode[0], 0x8000 | 0644); // S_IFREG | rw-r--r--
+        wr16(&g_inode[26], 1);            // links_count
+        stamp_inode_all(now_epoch_u32());
+    } else {
+        if (!read_inode(ino)) return -1;
+        if (inode_is_dir()) return -1; // refuse to write a directory
+    }
+    const uint32_t bs = g_sb.block_size;
+    const uint64_t cur_size = rd32(&g_inode[4]);
+    uint64_t blocks512 = rd32(&g_inode[28]);
+    uint32_t added = 0; // newly-allocated data + index blocks (for i_blocks)
+    uint64_t pos = off;
+    uint32_t srcoff = 0;
+    while (srcoff < len) {
+        const uint32_t lbn = static_cast<uint32_t>(pos / bs);
+        const uint32_t boff = static_cast<uint32_t>(pos % bs);
+        uint32_t chunk = bs - boff;
+        if (chunk > len - srcoff) chunk = len - srcoff;
+        uint32_t db = map_block(lbn);
+        bool newblk = false;
+        if (db == 0) {
+            db = alloc_block();
+            if (db == 0) break; // disk full -- best-effort short write
+            newblk = true; ++added;
+            for (uint32_t i = 0; i < bs; ++i) g_blk[i] = 0; // zero-fill hole/partial
+        } else if (!read_block(db, g_blk)) break;
+        for (uint32_t i = 0; i < chunk; ++i) g_blk[boff + i] = static_cast<uint8_t>(buf[srcoff + i]);
+        if (!write_block(db, g_blk)) break;
+        if (newblk) {
+            uint32_t idx = 0;
+            if (!inode_set_block(lbn, db, &idx)) break;
+            added += idx;
+        }
+        pos += chunk;
+        srcoff += chunk;
+    }
+    uint64_t newsize = off + srcoff;
+    if (newsize < cur_size) newsize = cur_size;
+    wr32(&g_inode[4], static_cast<uint32_t>(newsize));
+    if (added) blocks512 += static_cast<uint64_t>(added) * (bs / kSector);
+    wr32(&g_inode[28], static_cast<uint32_t>(blocks512));
+    stamp_inode_all(now_epoch_u32());
+    if (!write_inode(ino)) return -1;
+    if (is_new && !add_dirent(parent_ino, leaf, ino, 1 /*EXT2_FT_REG_FILE*/)) return -1;
+    return static_cast<int64_t>(srcoff);
+}
+
 bool ext2_symlink(const char *target, const char *path) {
     if (!g_sb.mounted || target == nullptr || path == nullptr) return false;
     uint32_t tlen = 0;
     while (target[tlen]) ++tlen;
     if (tlen == 0 || tlen > 255) return false; // ext2 symlink upper bound is 255 anyway
     uint32_t parent_ino = 0;
-    char leaf[64];
+    char leaf[256];
     if (!resolve_parent(path, &parent_ino, leaf, sizeof(leaf))) return false;
     if (!inode_is_dir()) return false;
     if (dir_lookup(leaf) != 0) return false; // already exists
@@ -976,7 +1241,7 @@ bool ext2_mkdir(const char *path) {
     if (!g_sb.mounted) return false;
     dentry_invalidate_all(); // new dir entry; keep dentry cache coherent
     uint32_t parent_ino = 0;
-    char leaf[64];
+    char leaf[256];
     if (!resolve_parent(path, &parent_ino, leaf, sizeof(leaf))) return false;
     if (!inode_is_dir()) return false;
     if (dir_lookup(leaf) != 0) return false; // already exists
@@ -1090,22 +1355,44 @@ bool ext2_unlink(const char *path) {
     if (!g_sb.mounted) return false;
     dentry_invalidate_all(); // path removed (inode freed/reused); must drop cache
     uint32_t parent_ino = 0;
-    char leaf[64];
+    char leaf[256];
     if (!resolve_parent(path, &parent_ino, leaf, sizeof(leaf))) return false;
     const uint32_t ino = dir_lookup(leaf);
     if (ino == 0) return false;
+    if (!read_inode(ino)) return false;
+    const bool was_dir = inode_is_dir();
+    // rmdir of a directory: (a) POSIX refuses a non-empty dir -- removing its
+    // dirent would orphan every child inode; (b) a dir's links_count is 2
+    // (parent entry + "." self-link), so the generic "decrement once, free at
+    // 0" path below never freed it -- EVERY removed dir leaked its inode + data
+    // block (apt's tmp.ci create/remove cycle exhausts inodes over a real
+    // multi-package install). Free a dir outright once empty, and give the
+    // parent back the ".." backref link mkdir() added.
+    if (was_dir && !dir_is_empty()) return false; // -ENOTEMPTY
     if (!remove_dirent(parent_ino, leaf)) return false;
 
-    // Drop a link; free the inode + its data when the count hits zero.
+    if (was_dir) {
+        if (read_inode(ino)) {
+            wr16(&g_inode[26], 0);
+            write_inode(ino);
+            free_inode_blocks();
+            free_inode(ino, true);
+        }
+        if (read_inode(parent_ino)) {
+            uint16_t pl = rd16(&g_inode[26]);
+            if (pl > 2) { wr16(&g_inode[26], pl - 1); write_inode(parent_ino); }
+        }
+        return true;
+    }
+    // Regular file / symlink: drop a link; free the inode + data at zero.
     if (read_inode(ino)) {
-        const bool was_dir = inode_is_dir();
         uint16_t links = rd16(&g_inode[26]);
         if (links > 0) --links;
         wr16(&g_inode[26], links);
         write_inode(ino);
         if (links == 0) {
             free_inode_blocks();
-            free_inode(ino, was_dir);
+            free_inode(ino, false);
         }
     }
     return true;
@@ -1116,7 +1403,7 @@ bool ext2_rename(const char *old_path, const char *new_path) {
     dentry_invalidate_all(); // old path -> inode mapping changes; must drop cache
     // Resolve both parents + leaves.
     uint32_t old_parent = 0, new_parent = 0;
-    char old_leaf[64], new_leaf[64];
+    char old_leaf[256], new_leaf[256];
     if (!resolve_parent(old_path, &old_parent, old_leaf, sizeof(old_leaf))) return false;
     if (!resolve_parent(new_path, &new_parent, new_leaf, sizeof(new_leaf))) return false;
     if (!read_inode(old_parent)) return false;
@@ -1211,7 +1498,7 @@ bool ext2_link(const char *target, const char *link_path) {
     write_inode(ino);
 
     uint32_t parent = 0;
-    char leaf[64];
+    char leaf[256];
     if (!resolve_parent(link_path, &parent, leaf, sizeof(leaf))) return false;
     if (!inode_is_dir()) return false;
     if (dir_lookup(leaf) != 0) return false; // already exists

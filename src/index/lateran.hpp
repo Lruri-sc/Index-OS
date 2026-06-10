@@ -9,7 +9,14 @@ namespace index {
 // files in a real on-disk format, in contrast to GrimoireFS (baked into the
 // image) and Bookshelf (in the heap).
 struct LateranEntry {
-    char name[64]; // file name, NUL-terminated (FAT 8.3 or ext2 long name)
+    // 256 (NAME_MAX+1, was 64): a 64-byte cap rejected the long URL-encoded
+    // filenames apt writes into its chroot, e.g.
+    //   HOST_dists_SUITE_main_binary-arm64_Packages.lz4.XXXXXX (~70+ chars),
+    // so create/mkstemp on those failed ENOENT and `apt update` couldn't store
+    // its index (fell back to the 4x-larger uncompressed Packages, or failed).
+    // kNameCap (testament) + the ext2 leaf buffers match this; ext2 on-disk
+    // name_len is a byte (255 max) so the format already supports it.
+    char name[256]; // file name, NUL-terminated (ext2 long name, up to 255)
     uint32_t size;
     uint16_t first_cluster;
     bool is_dir = false;
@@ -56,6 +63,10 @@ int64_t lateran_pread(const char *name, uint64_t offset, char *buf, uint32_t len
 // the bytes written, or -1 on error (disk full, root full, not mounted). The
 // data persists to the disk image.
 int64_t lateran_write_file(const char *name, const char *buf, uint32_t len);
+// Incremental write at offset (ext2 only). Returns bytes written, -1 on error,
+// or -2 if the backend (tmpfs/9p/FAT) has no incremental path -- the caller then
+// falls back to the whole-file read-modify-write of lateran_write_file.
+int64_t lateran_pwrite(const char *name, uint64_t off, const char *buf, uint32_t len);
 
 // Delete file `name` (path with optional subdirectories): free its cluster
 // chain and mark the directory entry deleted. Returns true if removed.
@@ -77,6 +88,7 @@ uint32_t lateran_list_dir(const char *path, LateranEntry *out, uint32_t max);
 // false if the path doesn't exist. Follows symlinks. Synthesises sensible
 // defaults for the FAT backend.
 bool lateran_stat(const char *path, LateranEntry *out);
+bool lateran_stat_nofollow(const char *path, LateranEntry *out); // lstat
 
 // Read the target of a symbolic link at `path`. Returns the length of the
 // NUL-terminated target written to `out`, or -1 if the path isn't a symlink,

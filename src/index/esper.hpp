@@ -107,8 +107,24 @@ struct PersonalReality {
 // offset -- read() re-reads the file and serves the next slice (small files).
 // pipe() hands out two more: a pipe_read end and a pipe_write end, both
 // pointing at the same Aiwass slot by index.
-constexpr uint32_t kMaxFds = 16;
-constexpr uint32_t kFdPathCap = 96;
+// 64 (was 16): dpkg/apt open many fds at once while unpacking a .deb (the ar
+// members, the dpkg database, status/maintainer-script pipes, locks). At 16 the
+// table overflowed -> a later fd was out of range -> fcntl(F_GETFL) fell through
+// to the "unknown fd" silent-0 (= O_RDONLY) branch -> glibc fdopen(fd,"w") inside
+// dpkg failed EINVAL ("Failed to open new FD - fdopen"), aborting `apt install`.
+// 64 ~ a small RLIMIT_NOFILE; cost is 64 Espers * 48 extra Fd * ~304 B ~= 0.9 MiB.
+constexpr uint32_t kMaxFds = 64;
+// 256 (was 96): Index's fd ops on regular files (ftruncate/truncate, the hash
+// read-back, kazakiri_notify) reconstruct the file from fds[].path, so a path
+// longer than this cap silently truncated and those ops then failed ENOENT. apt
+// inside the /apt-debian chroot opens e.g.
+//   /apt-debian/var/lib/apt/lists/partial/HOST_dists_SUITE_main_binary-arm64_Packages.gz
+// (~100+ chars: chroot prefix + URL-encoded mirror filename). At 96 it truncated,
+// so `apt update`'s ftruncate-to-0 + hash on the *.gz* index failed -> apt fell
+// back to re-downloading the 4x-larger uncompressed Packages. 256 matches kCwdCap
+// and covers the deepest realistic chroot+mirror path; cost is 16 fds * 64 Espers
+// * ~160 B = ~164 KiB static.
+constexpr uint32_t kFdPathCap = 256;
 enum class FdKind { closed, console, file, pipe_read, pipe_write, socket,
                      devnull, devzero, devrandom, devtty,
                      unix_sock /*AF_UNIX via ImaginaryNumberChannel*/,
@@ -127,6 +143,9 @@ struct Fd {
     int sock_idx = -1;     // valid iff kind is socket (Antenna table index)
     bool writable = false; // file opened for writing (O_WRONLY/O_RDWR)
     bool cloexec = false;  // O_CLOEXEC/FD_CLOEXEC: released on execve, not fork
+    bool nonblock = false; // O_NONBLOCK (fcntl F_SETFL): read/write return -EAGAIN
+                           // instead of parking when the pipe is empty/full. apt's
+                           // method runs its pipes non-blocking + drives select.
 };
 
 // Linux cwd buffer. Stored as an absolute, normalized path ("/" by default).
@@ -214,6 +233,12 @@ struct Esper {
     // receive the Linux-encoded 32-bit status ((code & 0xff) << 8), not the
     // raw int64 code that Index wait() writes.
     bool wait_status_is_linux = false;
+    // wait4()'s pid argument while this Esper is parked in wait4: >0 = wait for
+    // exactly that child pid, <=0 = any child. maybe_wake_parent_locked must only
+    // reap-and-return the MATCHING child, or a multi-child parent (dpkg-deb forks
+    // gzip+tar) gets the wrong pid back -- dpkg's subproc_wait checks `r != pid`
+    // and aborts ("wait for tar subprocess failed").
+    int32_t wait4_target_pid = 0;
     // True for an Esper created by clone(CLONE_VM) -- a thread sharing its
     // creator's address space. Its mm/images are shared, so teardown must not
     // free them while siblings still run (mm is refcounted, images too).
@@ -394,6 +419,14 @@ struct Esper {
     // semantics; we keep it shared per address space, which is what musl asks
     // for in practice).
     char cwd[kCwdCap] = {};
+    // chroot(2) jail root for this process. Empty == no chroot (root is "/"),
+    // which keeps path resolution byte-for-byte identical to the no-chroot case.
+    // When set (e.g. "/apt-debian"), every absolute path resolves UNDER it and
+    // ".." can't climb above it (resolve_path floors at root_depth). NOTE: cwd
+    // above is stored as a REAL (root_dir-prefixed) path; getcwd strips root_dir
+    // back off. Inherited across fork/clone and preserved across execve (Linux).
+    char root_dir[kCwdCap] = {};
+    uint32_t root_depth = 0; // path-component count of root_dir (the ".." floor)
 
     // Pending argv/envp for the next program image built on this slot. Set by
     // kSysExec / `linuxrun` / linux_execve right before load_elf_into_slot;
@@ -447,6 +480,12 @@ void esper_set_online_cpus(uint32_t n);
 void esper_set_kick(void (*fn)(uint32_t cpu));
 void esper_kick_secondaries();
 int esper_running_on(uint32_t cpu); // [dbg] g_running[cpu]
+// [HWEXEC] hardware-execution truth: a core sets this right before eret'ing into
+// an Esper, clears it on leave_user. esper_create won't recycle a still-executing
+// slot (the smp=8 slot-reuse-while-running FAULTLOOP root).
+void esper_set_active_esper(int idx);
+void esper_clear_active_esper();
+int esper_index(const Esper *e);
 
 // --- SMP-safe scheduler primitives (g_esper_lock held internally) ---
 //
@@ -470,6 +509,9 @@ int esper_pick_and_claim(int after);
 // needed for those writes), clear g_running[cpu], then pick + claim next.
 // Returns next idx or -1 if no one else is ready (caller does leave_user).
 int esper_park_and_pick(int cur_idx);
+// Like esper_park_and_pick, but on no-successor atomically keeps cur running
+// (no park->unpark window). Used by blocking wait4 to avoid double-scheduling.
+int esper_park_and_pick_keep(int cur_idx);
 
 // IRQ preemption: cur_idx was running; caller has already saved its EL0
 // registers into cur->regs/elr/spsr/sp_el0/tpidr from the IRQ frame.

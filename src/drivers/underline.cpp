@@ -478,11 +478,14 @@ bool underline_write(const Underline &disk, uint64_t sector, const void *buffer)
         // the vCPU and the aio completion never runs (the SMP=1 java read of
         // sector ~62k hung at CPU 0% right here; console tracing's occasional MMIO
         // write vm-exited and unstuck it = the Heisenbug). Re-ring the doorbell
-        // every 4096 spins -- an MMIO store vm-exits, letting qemu run its main
+        // every 256 spins -- an MMIO store vm-exits, letting qemu run its main
         // loop to complete the request -- but only OCCASIONALLY: a per-spin
         // doorbell thrashes the BQL and still hung. No IRQ unmask, so it's safe in
         // syscall context (WFI/enable-IRQ crashed init via EL1-IRQ nesting).
-        if ((spin & 0xFFF) == 0xFFF) {
+        // 256 (was 4096): matches underline_read; the larger interval left writes
+        // spinning ~8x longer before qemu's main loop ran the completion, which is
+        // most of the heavy guest-write (apt/dpkg, busybox cp) slowness on HVF.
+        if ((spin & 0xFF) == 0xFF) {
             write32(disk.notify_addr, 0);
         }
     }
